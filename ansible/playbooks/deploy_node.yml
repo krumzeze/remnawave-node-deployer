@@ -1,0 +1,31 @@
+---
+# Установка Docker и разворот контейнера remnanode.
+# SECRET_KEY/NODE_PORT приходят из CreateNode (Remnawave API) через extra-vars.
+- name: Deploy remnanode
+  hosts: all
+  become: true
+  vars:
+    remnanode_secret_key: ""   # передаётся из оркестратора
+    remnanode_port: 0
+  tasks:
+    - name: Install Docker via official convenience script
+      ansible.builtin.shell: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: Create remnanode dir
+      ansible.builtin.file:
+        path: /opt/remnanode
+        state: directory
+        mode: "0750"
+
+    - name: Render docker-compose for remnanode
+      ansible.builtin.template:
+        src: remnanode-compose.yml.j2
+        dest: /opt/remnanode/docker-compose.yml
+        mode: "0640"
+
+    - name: Up remnanode
+      community.docker.docker_compose_v2:
+        project_src: /opt/remnanode
+        state: present

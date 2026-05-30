@@ -1,0 +1,42 @@
+---
+# Хардденинг сервера. Запускается ПОСЛЕ того, как вход по ключу проверен.
+# Отключение парольного входа — последний шаг (принцип «не навреди», ADR 0002).
+- name: Harden server
+  hosts: all
+  become: true
+  tasks:
+    - name: Ensure UFW installed
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+
+    - name: Allow SSH and default-deny incoming
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled
+        policy: deny
+
+    - name: Install fail2ban
+      ansible.builtin.apt:
+        name: fail2ban
+        state: present
+
+    # TODO: вынести проверку входа по ключу до этой задачи
+    - name: Disable SSH password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: Restart sshd
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: ssh
+        state: restarted

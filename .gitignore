@@ -1,0 +1,17 @@
+
+# Локальные рабочие заметки — не публиковать
+notes/
+
+# Секреты и окружение
+.env
+secrets/keys/
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

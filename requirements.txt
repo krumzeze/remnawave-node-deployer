@@ -1,0 +1,35 @@
+# Bot
+aiogram>=3.7,<4
+
+# SSH bootstrap
+asyncssh>=2.14
+
+# Config management
+ansible-runner>=2.3
+
+# Remnawave API
+remnawave>=2.7,<2.8
+
+# Queue / workers
+arq>=0.26
+redis>=5.0
+
+# Secrets
+hvac>=2.1            # HashiCorp Vault client
+
+# DB
+sqlalchemy[asyncio]>=2.0
+asyncpg>=0.29
+alembic>=1.13
+
+# Web dashboard
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# Config
+pydantic>=2.6
+pydantic-settings>=2.2
+
+# Dev / tests
+pytest>=8.0
+pytest-asyncio>=0.23
