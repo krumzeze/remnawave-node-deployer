@@ -92,7 +92,7 @@ bot/            Telegram-бот: хендлеры и FSM-диалог добав
 orchestrator/   оркестрация: state-машина, SSH bootstrap, клиент API, задачи
 ansible/        плейбуки hardening и разворота ноды
 db/             модели базы данных
-secrets/        интеграция с Vault
+secretstore/    интеграция с Vault
 web/            веб-интерфейс (FastAPI)
 tests/          тесты
 ```
