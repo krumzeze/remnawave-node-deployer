@@ -23,5 +23,6 @@ class AddNode(StatesGroup):
 
     # Набор inbound'ов профиля (ADR 0005)
     choose_inbounds = State()
+    wait_domain = State()      # только если выбран TLS-инбаунд: домен оператора
 
     confirm = State()

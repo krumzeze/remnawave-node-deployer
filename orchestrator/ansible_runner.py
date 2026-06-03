@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 PLAYBOOKS_DIR = Path(__file__).resolve().parent.parent / "ansible" / "playbooks"
 HARDENING_PLAYBOOK = PLAYBOOKS_DIR / "hardening.yml"
 DEPLOY_NODE_PLAYBOOK = PLAYBOOKS_DIR / "deploy_node.yml"
+ISSUE_CERT_PLAYBOOK = PLAYBOOKS_DIR / "issue_cert.yml"   # TLS-инбаунды, ADR 0005
 
 # Имя хоста в инвентаре. Один сервер на запуск — больше для ноды не нужно.
 INVENTORY_HOST = "node"

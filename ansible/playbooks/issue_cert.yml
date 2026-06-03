@@ -1,0 +1,78 @@
+---
+# Выпуск TLS-сертификата для домена ноды по HTTP-01 (ADR 0005).
+# Запускается ТОЛЬКО для TLS-инбаундов и ПОСЛЕ того, как оркестратор убедился,
+# что домен уже резолвится на эту ноду (см. orchestrator/domain.py). Сертификат
+# раскладывается в каталог, который монтируется в контейнер remnanode, поэтому
+# плейбук идёт до deploy_node.
+#
+# HTTP-01, а не DNS-01: не требует API регистратора, поэтому registrar-agnostic
+# (домен оператор берёт где угодно). Нужен свободный и открытый порт 80.
+- name: Issue TLS certificate via acme.sh (HTTP-01)
+  hosts: all
+  become: true
+  vars:
+    cert_domain: ""                       # передаётся из оркестратора
+    cert_email: ""                         # для регистрации аккаунта ACME
+    cert_dir_host: /opt/remnanode/certs    # хост-каталог, монтируется в контейнер
+    acme_home: /root/.acme.sh
+    acme_server: letsencrypt               # без привязки к ZeroSSL/аккаунту по умолчанию
+  tasks:
+    - name: Require cert_domain
+      ansible.builtin.assert:
+        that:
+          - cert_domain | length > 0
+        fail_msg: "cert_domain не задан — нечего выпускать"
+
+    # acme.sh --standalone поднимает собственный слушатель на :80 через socat.
+    - name: Install socat (needed by acme.sh standalone mode)
+      ansible.builtin.apt:
+        name: socat
+        state: present
+        update_cache: true
+
+    # HTTP-01 проходит по порту 80 — открываем его на время и для проверки CA.
+    - name: Allow HTTP (port 80) for ACME challenge
+      community.general.ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: Install acme.sh
+      ansible.builtin.shell: |
+        set -e
+        curl -fsSL https://get.acme.sh | sh -s email={{ cert_email | quote }}
+      args:
+        creates: "{{ acme_home }}/acme.sh"
+
+    - name: Select ACME CA
+      ansible.builtin.command:
+        cmd: "{{ acme_home }}/acme.sh --set-default-ca --server {{ acme_server }}"
+      changed_when: false
+
+    - name: Ensure per-domain cert dir
+      ansible.builtin.file:
+        path: "{{ cert_dir_host }}/{{ cert_domain }}"
+        state: directory
+        mode: "0750"
+
+    # Идемпотентно: при повторе acme.sh сам видит валидный сертификат и не
+    # переоформляет его. rc=0 — выпущен/уже есть; иное — реальная ошибка.
+    - name: Issue certificate (HTTP-01 standalone)
+      ansible.builtin.command:
+        cmd: >-
+          {{ acme_home }}/acme.sh --issue --standalone
+          -d {{ cert_domain }}
+          --server {{ acme_server }}
+        creates: "{{ acme_home }}/{{ cert_domain }}_ecc/{{ cert_domain }}.cer"
+
+    # Ставим сертификат в монтируемый каталог. reloadcmd перезапускает контейнер
+    # ноды при автообновлении (acme.sh заводит cron сам), чтобы xray подхватил
+    # новый сертификат без нашего участия.
+    - name: Install certificate into mounted dir
+      ansible.builtin.command:
+        cmd: >-
+          {{ acme_home }}/acme.sh --install-cert -d {{ cert_domain }} --ecc
+          --key-file {{ cert_dir_host }}/{{ cert_domain }}/key.pem
+          --fullchain-file {{ cert_dir_host }}/{{ cert_domain }}/fullchain.pem
+          --reloadcmd "docker restart remnanode || true"
+      changed_when: true

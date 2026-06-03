@@ -20,10 +20,10 @@ from typing import Any, Awaitable, Callable
 from arq.connections import RedisSettings
 
 from config import settings
-from orchestrator import ansible_runner, reporting, ssh_bootstrap, xray_config
+from orchestrator import ansible_runner, domain, reporting, ssh_bootstrap, xray_config
 from orchestrator.remnawave_client import NodeConnState, RemnawaveClient
 from orchestrator.statemachine import NodeState, can_transition
-from orchestrator.xray_config import InboundChoice
+from orchestrator.xray_config import TLS_CHOICES, InboundChoice
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +33,10 @@ logger = logging.getLogger(__name__)
 NODE_APP_PORT = 2222
 
 # Дефолтный набор inbound'ов (ADR 0005 «дефолт все»), но только domain-free:
-# TLS-ветки требуют домена и сертификата acme.sh — этого флоу пока нет, поэтому
-# в дефолт они не входят. Если payload явно пришлёт TLS-вариант без домена,
-# build_profile упадёт с понятной ошибкой и конвейер уйдёт в failed.
+# TLS-ветки требуют домена и сертификата acme.sh. В дефолт они не входят — домен
+# спрашиваем только при явном выборе TLS (см. selection_needs_domain в боте).
+# Если payload явно пришлёт TLS-вариант без домена, _setup_tls упадёт с понятной
+# ошибкой и конвейер уйдёт в failed.
 DEFAULT_INBOUNDS: tuple[InboundChoice, ...] = (
     InboundChoice.VLESS_REALITY_TCP,
     InboundChoice.VLESS_XHTTP_REALITY,
@@ -43,9 +44,22 @@ DEFAULT_INBOUNDS: tuple[InboundChoice, ...] = (
     InboundChoice.SHADOWSOCKS,
 )
 
+# Каталог сертификатов внутри контейнера remnanode (точка монтирования из
+# compose-шаблона). На хосте им управляет issue_cert.yml; xray внутри контейнера
+# видит сертификат именно по этому пути, поэтому cert_file/key_file для
+# build_profile строим от него, а не от хост-пути.
+NODE_CERT_DIR_CONTAINER = "/etc/remnanode/certs"
+
 # Поллинг статуса ноды после регистрации.
 POLL_ATTEMPTS = 36          # 36 × 5с = 3 минуты
 POLL_INTERVAL_SEC = 5.0
+
+
+def _cert_paths(domain_name: str) -> tuple[str, str]:
+    """Пути сертификата и ключа внутри контейнера для данного домена.
+    Совпадают с тем, куда issue_cert.yml кладёт fullchain.pem/key.pem."""
+    base = f"{NODE_CERT_DIR_CONTAINER}/{domain_name}"
+    return f"{base}/fullchain.pem", f"{base}/key.pem"
 
 
 class ProvisionError(Exception):
@@ -76,6 +90,9 @@ class ProvisionDeps:
         ansible_runner.run_playbook
     )
     build_profile: Callable[..., xray_config.GeneratedProfile] = xray_config.build_profile
+    check_domain: Callable[[str, str], Awaitable[domain.DomainCheck]] = (
+        domain.check_points_to
+    )
     make_client: Callable[[str, str], RemnawaveClient] = _default_make_client
     vault_put: Callable[[str, dict], Any] | None = None
     report: Callable[[NodeState, str], Awaitable[None]] = _noop_report
@@ -145,6 +162,48 @@ class _Pipeline:
             return
         self.deps.vault_put(f"nodes/{ip}/ssh", {"private_key": private_key})
 
+    async def _setup_tls(
+        self, ip: str, login: str, private_key: str, choices: list[InboundChoice]
+    ) -> tuple[str | None, str | None, str | None]:
+        """Подготовить TLS, если среди выбранных есть домен-инбаунд (ADR 0005).
+
+        Возвращает (domain, cert_file, key_file) для build_profile, либо тройку
+        None для domain-free набора. Сначала гейт резолва (домен уже должен
+        указывать на ноду), затем выпуск сертификата по HTTP-01 — необратимого
+        тут нет, но без рабочего домена выпуск бессмысленен (принцип «не навреди»).
+        """
+        if not any(c in TLS_CHOICES for c in choices):
+            return None, None, None
+
+        raw = self.p.get("tls_domain")
+        if not raw:
+            raise ProvisionError("для TLS-инбаунда нужен домен (tls_domain не задан)")
+        domain_name = domain.normalize_domain(raw)
+
+        await self.deps.report(
+            self.state, f"Проверяю, что {domain_name} указывает на {ip}"
+        )
+        check = await self.deps.check_domain(domain_name, ip)
+        if not check.ok:
+            raise ProvisionError(check.detail)
+
+        await self.deps.report(self.state, f"Выпускаю сертификат для {domain_name}")
+        cert = await self.deps.run_playbook(
+            ansible_runner.ISSUE_CERT_PLAYBOOK,
+            ip,
+            login,
+            private_key,
+            extra_vars={
+                "cert_domain": domain_name,
+                "cert_email": self.p.get("cert_email", ""),
+            },
+        )
+        if not cert.ok:
+            raise ProvisionError(cert.detail)
+
+        cert_file, key_file = _cert_paths(domain_name)
+        return domain_name, cert_file, key_file
+
     async def _run(self) -> NodeConnState:
         ip = self.p["ip"]
         login = self.p["login"]
@@ -173,6 +232,15 @@ class _Pipeline:
         if not hardening.ok:
             raise ProvisionError(hardening.detail)
 
+        # TLS-инбаунды (ADR 0005): домен обязан уже указывать на ноду, после чего
+        # выпускаем сертификат по HTTP-01. Делаем это ДО deploy_node, чтобы
+        # сертификат лежал в монтируемом каталоге к моменту старта контейнера.
+        # Для domain-free набора шаг пропускается и пути остаются None.
+        choices = self._inbound_choices()
+        tls_domain, cert_file, key_file = await self._setup_tls(
+            ip, login, private_key, choices
+        )
+
         # Нода доверяет панели по её публичному ключу (ADR 0004): кладём его в
         # SSL_CERT контейнера. Порт ноды задаём сами — он же уйдёт в create_node.
         client = self.deps.make_client(panel_url, panel_token)
@@ -194,12 +262,11 @@ class _Pipeline:
         # 3. Registering: профиль конфигурации → нода.
         await self._advance(NodeState.REGISTERING, "Регистрирую ноду в панели")
 
-        choices = self._inbound_choices()
         generated = self.deps.build_profile(
             choices,
-            tls_domain=self.p.get("tls_domain"),
-            cert_file=self.p.get("cert_file"),
-            key_file=self.p.get("key_file"),
+            tls_domain=tls_domain,
+            cert_file=cert_file,
+            key_file=key_file,
         )
 
         # Панель сама присваивает inbound'ам uuid'ы; связываем по тегам (ADR 0006).
@@ -309,7 +376,7 @@ async def provision_node(ctx: dict, payload: dict) -> None:
 
     payload (из FSM-диалога бота): ip, login, auth (password|key) и либо password,
     либо private_key; node_id и chat_id для отчётности; опционально
-    panel_url/panel_token, inbounds, country_code, tls_domain/cert_file/key_file.
+    panel_url/panel_token, inbounds, country_code, tls_domain.
     Пароль живёт только в payload задачи и стирается в bootstrap; в БД он не пишется.
 
     Зависимости берутся из ctx["deps"] (ProvisionDeps) — это путь тестов; в проде

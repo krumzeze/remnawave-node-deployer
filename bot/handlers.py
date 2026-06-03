@@ -23,21 +23,39 @@ from arq.connections import ArqRedis, RedisSettings
 
 from bot.states import AddNode
 from config import settings
+from orchestrator import domain
 from orchestrator.ssh_bootstrap import _generate_keypair
-from orchestrator.xray_config import InboundChoice
+from orchestrator.xray_config import TLS_CHOICES, InboundChoice
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Меню inbound'ов (ADR 0005). Пока только domain-free: TLS-варианты требуют
-# домена и сертификата acme.sh, а этого флоу ещё нет — добавим вместе с ним.
+# Меню inbound'ов (ADR 0005), все шесть пунктов в порядке ADR. Пункты 3 и 5 —
+# TLS, им нужен домен: при их выборе диалог уходит на шаг ввода домена, дальше
+# воркер проверяет резолв и выпускает сертификат (orchestrator/domain.py +
+# issue_cert.yml). Остальные — domain-free.
 INBOUND_MENU: tuple[tuple[str, InboundChoice, str], ...] = (
     ("1", InboundChoice.VLESS_REALITY_TCP, "VLESS + Reality (TCP)"),
     ("2", InboundChoice.VLESS_XHTTP_REALITY, "VLESS + XHTTP + Reality"),
-    ("3", InboundChoice.VLESS_GRPC_REALITY, "VLESS + gRPC + Reality"),
-    ("4", InboundChoice.SHADOWSOCKS, "Shadowsocks"),
+    ("3", InboundChoice.VLESS_XHTTP_TLS, "VLESS + XHTTP + TLS (нужен домен)"),
+    ("4", InboundChoice.VLESS_GRPC_REALITY, "VLESS + gRPC + Reality"),
+    ("5", InboundChoice.TROJAN_WS_TLS, "Trojan + WS + TLS (нужен домен)"),
+    ("6", InboundChoice.SHADOWSOCKS, "Shadowsocks"),
 )
 _MENU_BY_NUMBER = {num: choice for num, choice, _ in INBOUND_MENU}
+
+
+def selection_needs_domain(inbounds: list[str] | None) -> bool:
+    """Нужен ли домен для выбранного набора.
+
+    None («все/по умолчанию») доменом не считаем: дефолт у воркера domain-free,
+    домен спрашиваем только при явном выборе TLS-инбаунда (ADR 0005 — «домен
+    запрашиваем, когда он реально нужен»)."""
+    if not inbounds:
+        return False
+    tls_values = {c.value for c in TLS_CHOICES}
+    return any(v in tls_values for v in inbounds)
+
 
 # Пул arq на процесс бота. Создаётся лениво при первой постановке задачи.
 _queue: ArqRedis | None = None
@@ -100,6 +118,8 @@ def build_payload(data: dict, *, node_id: int, chat_id: int) -> dict:
         payload["panel_token"] = data["panel_token"]
     if data.get("inbounds"):
         payload["inbounds"] = data["inbounds"]
+    if data.get("tls_domain"):
+        payload["tls_domain"] = data["tls_domain"]
     return payload
 
 
@@ -237,9 +257,47 @@ async def choose_inbounds(message: Message, state: FSMContext) -> None:
         await message.answer(f"Не знаю пункт «{exc}». Введи номера из списка или all.")
         return
     await state.update_data(inbounds=inbounds)
+
+    # TLS-инбаунд требует домена (ADR 0005) — уводим на шаг ввода домена.
+    if selection_needs_domain(inbounds):
+        await state.set_state(AddNode.wait_domain)
+        await message.answer(
+            "Для TLS-инбаунда нужен домен. Введи поддомен для этой ноды "
+            "(например vpn.example.com)."
+        )
+        return
+
     await state.set_state(AddNode.confirm)
     chosen = "все" if inbounds is None else ", ".join(inbounds)
     await message.answer(f"Inbound'ы: {chosen}.\nЗапустить? Напиши: ok")
+
+
+@router.message(AddNode.wait_domain)
+async def wait_domain(message: Message, state: FSMContext) -> None:
+    domain_name = domain.normalize_domain(message.text or "")
+    if not domain.is_valid_domain(domain_name):
+        await message.answer("Не похоже на домен. Введи, например, vpn.example.com.")
+        return
+    await state.update_data(tls_domain=domain_name)
+    await state.set_state(AddNode.confirm)
+
+    data = await state.get_data()
+    inbounds = data.get("inbounds")
+    chosen = "все" if not inbounds else ", ".join(inbounds)
+    ip = data.get("ip", "<IP ноды>")
+    # Generic-инструкция A-записи (registrar-agnostic, ADR 0005): саму запись
+    # создаёт оператор у своего регистратора, мы лишь говорим, что нужно. Перед
+    # выпуском сертификата воркер сам проверит, что домен уже указывает на ноду.
+    await message.answer(
+        f"Inbound'ы: {chosen}.\n"
+        f"Домен: {domain_name}.\n\n"
+        "Создай у регистратора A-запись:\n"
+        f"<code>{domain_name} → {ip}</code>\n"
+        "и дождись, пока она применится. Перед выпуском сертификата я проверю, "
+        "что домен резолвится на ноду.\n\n"
+        "Когда A-запись создана — напиши: ok",
+        parse_mode="HTML",
+    )
 
 
 @router.message(AddNode.confirm, F.text.lower() == "ok")

@@ -248,3 +248,104 @@ async def test_unknown_inbound_in_payload_fails():
     await tasks.provision_node({"deps": deps}, _payload(inbounds=["bogus"]))
 
     assert reports[-1] is NodeState.FAILED
+
+
+# --- TLS-ветка (ADR 0005): домен-гейт + выпуск сертификата ----------------
+
+class _TlsClient(_FakeClient):
+    """Панель, знающая про TLS-инбаунд: возвращает его uuid по тегу."""
+
+    async def create_config_profile(self, name, config):
+        self.created_profile_config = config
+        return CreatedProfile(
+            uuid="prof-tls",
+            tag_to_inbound={"vless-xhttp-tls": "inb-tls"},
+        )
+
+
+def _tls_deps(*, client, reports, **over):
+    """ProvisionDeps для TLS: build_profile и run_playbook фиксируют вызовы,
+    check_domain по умолчанию подтверждает совпадение домена."""
+    from orchestrator import domain
+
+    profile_calls = {}
+    playbooks = []
+    over_check = over.pop("check_domain", None)
+
+    def build_profile(choices, **kw):
+        profile_calls.update(kw)
+        return _generated([c.value for c in choices])
+
+    async def run_playbook(playbook, host, login, private_key, **kw):
+        from pathlib import Path
+        playbooks.append(Path(str(playbook)).name)
+        return ansible_runner.PlaybookResult(ok=True)
+
+    async def check_domain(domain_name, expected_ip):
+        return domain.DomainCheck(ok=True, detail="ok", resolved=[expected_ip])
+
+    deps = _deps(
+        client=client, reports=reports,
+        build_profile=build_profile, run_playbook=run_playbook,
+        check_domain=over_check or check_domain, **over,
+    )
+    return deps, profile_calls, playbooks
+
+
+@pytest.mark.asyncio
+async def test_tls_issues_cert_and_passes_paths():
+    reports = []
+    client = _TlsClient([NodeConnState.ONLINE])
+    deps, profile_calls, playbooks = _tls_deps(client=client, reports=reports)
+
+    await tasks.provision_node(
+        {"deps": deps},
+        _payload(inbounds=["vless-xhttp-tls"], tls_domain="vpn.example.com"),
+    )
+
+    assert NodeState.ONLINE in reports
+    # issue_cert прогнан до deploy_node
+    assert "issue_cert.yml" in playbooks
+    assert playbooks.index("issue_cert.yml") < playbooks.index("deploy_node.yml")
+    # пути сертификата проброшены в build_profile внутри контейнера
+    assert profile_calls["tls_domain"] == "vpn.example.com"
+    assert profile_calls["cert_file"].endswith("/vpn.example.com/fullchain.pem")
+    assert profile_calls["cert_file"].startswith(tasks.NODE_CERT_DIR_CONTAINER)
+
+
+@pytest.mark.asyncio
+async def test_tls_without_domain_fails():
+    reports = []
+    client = _TlsClient([NodeConnState.ONLINE])
+    deps, _, playbooks = _tls_deps(client=client, reports=reports)
+
+    await tasks.provision_node(
+        {"deps": deps}, _payload(inbounds=["vless-xhttp-tls"])  # домена нет
+    )
+
+    assert reports[-1] is NodeState.FAILED
+    assert "issue_cert.yml" not in playbooks
+
+
+@pytest.mark.asyncio
+async def test_tls_domain_mismatch_blocks_issue():
+    from orchestrator import domain
+
+    reports = []
+    client = _TlsClient([NodeConnState.ONLINE])
+
+    async def bad_check(domain_name, expected_ip):
+        return domain.DomainCheck(ok=False, detail="смотрит не туда")
+
+    deps, _, playbooks = _tls_deps(
+        client=client, reports=reports, check_domain=bad_check
+    )
+
+    await tasks.provision_node(
+        {"deps": deps},
+        _payload(inbounds=["vless-xhttp-tls"], tls_domain="vpn.example.com"),
+    )
+
+    assert reports[-1] is NodeState.FAILED
+    # гейт не прошёл → сертификат не выпускаем
+    assert "issue_cert.yml" not in playbooks

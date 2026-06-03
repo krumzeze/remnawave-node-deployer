@@ -7,6 +7,7 @@
   vars:
     remnanode_secret_key: ""   # передаётся из оркестратора
     remnanode_port: 0
+    cert_dir_host: /opt/remnanode/certs
   tasks:
     - name: Install Docker via official convenience script
       ansible.builtin.shell: curl -fsSL https://get.docker.com | sh
@@ -16,6 +17,15 @@
     - name: Create remnanode dir
       ansible.builtin.file:
         path: /opt/remnanode
+        state: directory
+        mode: "0750"
+
+    # Каталог монтируется в контейнер всегда (см. шаблон compose). Для TLS его
+    # уже наполнил issue_cert; для domain-free он просто пуст — создаём, чтобы
+    # docker не сделал на его месте root-only каталог и монтирование не упало.
+    - name: Ensure certs dir exists (mounted into container)
+      ansible.builtin.file:
+        path: "{{ cert_dir_host }}"
         state: directory
         mode: "0750"
 

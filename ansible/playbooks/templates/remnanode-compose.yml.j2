@@ -6,3 +6,8 @@ services:
     environment:
       SSL_CERT: "{{ remnanode_secret_key }}"
       APP_PORT: "{{ remnanode_port }}"
+    volumes:
+      # Сертификаты acme.sh (TLS-инбаунды, ADR 0005). Каталог есть всегда; для
+      # domain-free набора он просто пустой. Пути сертификата в Xray-конфиге
+      # указываются относительно точки монтирования внутри контейнера.
+      - {{ cert_dir_host | default('/opt/remnanode/certs') }}:{{ cert_dir_container | default('/etc/remnanode/certs') }}:ro
