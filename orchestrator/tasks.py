@@ -204,6 +204,31 @@ class _Pipeline:
         cert_file, key_file = _cert_paths(domain_name)
         return domain_name, cert_file, key_file
 
+    async def _open_inbound_ports(
+        self, ip: str, login: str, private_key: str,
+        generated: xray_config.GeneratedProfile,
+    ) -> None:
+        """Открыть в UFW порты занятые выбранными inbound'ами (ADR 0005).
+
+        Открываем ровно те порты, что генератор раздал inbound'ам, а не весь
+        пул фолбэков. Порт 80 для ACME здесь не трогаем — его открывает
+        issue_cert.yml и только для TLS-набора (для domain-free 80 не нужен).
+        """
+        ports = sorted(set(generated.ports.values()))
+        if not ports:
+            raise ProvisionError("генератор не вернул портов inbound'ов")
+
+        await self.deps.report(self.state, f"Открываю порты в UFW: {ports}")
+        result = await self.deps.run_playbook(
+            ansible_runner.OPEN_PORTS_PLAYBOOK,
+            ip,
+            login,
+            private_key,
+            extra_vars={"inbound_ports": ports},
+        )
+        if not result.ok:
+            raise ProvisionError(result.detail)
+
     async def _run(self) -> NodeConnState:
         ip = self.p["ip"]
         login = self.p["login"]
@@ -241,6 +266,21 @@ class _Pipeline:
             ip, login, private_key, choices
         )
 
+        # Профиль собираем здесь, до deploy_node: из него берём раскладку портов,
+        # чтобы открыть их в UFW прежде, чем нода начнёт принимать трафик. Сам
+        # config уйдёт в панель ниже, на шаге REGISTERING.
+        generated = self.deps.build_profile(
+            choices,
+            tls_domain=tls_domain,
+            cert_file=cert_file,
+            key_file=key_file,
+        )
+
+        # hardening поставил default deny + только 22; теперь разрешаем порты
+        # выбранных inbound'ов, иначе трафик до ноды не дойдёт. Делаем до старта
+        # контейнера, чтобы он поднимался уже за открытым firewall'ом.
+        await self._open_inbound_ports(ip, login, private_key, generated)
+
         # Нода доверяет панели по её публичному ключу (ADR 0004): кладём его в
         # SSL_CERT контейнера. Порт ноды задаём сами — он же уйдёт в create_node.
         client = self.deps.make_client(panel_url, panel_token)
@@ -261,13 +301,6 @@ class _Pipeline:
 
         # 3. Registering: профиль конфигурации → нода.
         await self._advance(NodeState.REGISTERING, "Регистрирую ноду в панели")
-
-        generated = self.deps.build_profile(
-            choices,
-            tls_domain=tls_domain,
-            cert_file=cert_file,
-            key_file=key_file,
-        )
 
         # Панель сама присваивает inbound'ам uuid'ы; связываем по тегам (ADR 0006).
         profile = await client.create_config_profile(f"node-{ip}", generated.config)

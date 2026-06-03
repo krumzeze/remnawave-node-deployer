@@ -165,3 +165,26 @@ def test_no_clients_injected():
     for inb in prof.config["inbounds"]:
         # пользователей панель подставляет сама — список клиентов пуст
         assert inb["settings"].get("clients") == []
+
+
+def test_ports_map_exposed_and_matches_inbounds():
+    prof = build_profile([
+        InboundChoice.VLESS_REALITY_TCP,
+        InboundChoice.SHADOWSOCKS,
+    ])
+    # Карта tag→port совпадает с портами в самих inbound'ах.
+    in_ports = {o["tag"]: o["port"] for o in prof.config["inbounds"]}
+    assert prof.ports == in_ports
+    # Первый выбранный сел на 443.
+    assert prof.ports["vless-reality-tcp"] == 443
+    # Только выбранные теги, ничего лишнего.
+    assert set(prof.ports) == {"vless-reality-tcp", "shadowsocks"}
+
+
+def test_ports_map_respects_overrides():
+    prof = build_profile(
+        [InboundChoice.VLESS_REALITY_TCP, InboundChoice.SHADOWSOCKS],
+        port_overrides={InboundChoice.SHADOWSOCKS: 9999},
+    )
+    assert prof.ports["shadowsocks"] == 9999
+    assert prof.ports["vless-reality-tcp"] == 443

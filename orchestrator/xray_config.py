@@ -98,6 +98,9 @@ class GeneratedProfile:
     config: dict
     tags: list[str]
     reality_keys: dict[str, RealityKeys] = field(default_factory=dict)
+    # Раскладка портов tag→port: какой inbound на каком порту сел. Нужна выше по
+    # стеку, чтобы открыть в UFW ровно занятые порты, а не весь пул вслепую.
+    ports: dict[str, int] = field(default_factory=dict)
 
 
 def generate_reality_keys(*, short_id_count: int = 3) -> RealityKeys:
@@ -300,6 +303,7 @@ def build_profile(
     inbounds: list[dict] = []
     tags: list[str] = []
     reality_keys: dict[str, RealityKeys] = {}
+    ports_by_tag: dict[str, int] = {}
 
     for choice in ordered:
         keys = generate_reality_keys() if choice in REALITY_CHOICES else None
@@ -311,6 +315,7 @@ def build_profile(
         )
         inbounds.append(inbound)
         tags.append(inbound["tag"])
+        ports_by_tag[inbound["tag"]] = ports[choice]
         if keys is not None:
             reality_keys[inbound["tag"]] = keys
 
@@ -324,4 +329,6 @@ def build_profile(
         "routing": {"rules": []},
     }
 
-    return GeneratedProfile(config=config, tags=tags, reality_keys=reality_keys)
+    return GeneratedProfile(
+        config=config, tags=tags, reality_keys=reality_keys, ports=ports_by_tag
+    )

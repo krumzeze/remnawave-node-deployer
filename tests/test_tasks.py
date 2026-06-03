@@ -58,8 +58,12 @@ class _FakeClient:
 
 
 def _generated(tags):
+    # Раскладка портов как у реального генератора: первый — 443, дальше фолбэки.
+    pool = [443, 8443, 2053, 2083, 2087, 2096]
+    tags = list(tags)
+    ports = {t: pool[i] for i, t in enumerate(tags)}
     return GeneratedProfile(
-        config={"inbounds": [{"tag": t} for t in tags]}, tags=list(tags)
+        config={"inbounds": [{"tag": t} for t in tags]}, tags=tags, ports=ports
     )
 
 
@@ -349,3 +353,83 @@ async def test_tls_domain_mismatch_blocks_issue():
     assert reports[-1] is NodeState.FAILED
     # гейт не прошёл → сертификат не выпускаем
     assert "issue_cert.yml" not in playbooks
+
+
+# --- Открытие портов inbound'ов в UFW ---------------------------------------
+
+def _recording_run_playbook(calls):
+    """run_playbook, фиксирующий имя плейбука и extra_vars каждого вызова."""
+    from pathlib import Path
+
+    async def run_playbook(playbook, host, login, private_key, **kw):
+        calls.append((Path(str(playbook)).name, kw.get("extra_vars") or {}))
+        return ansible_runner.PlaybookResult(ok=True)
+
+    return run_playbook
+
+
+@pytest.mark.asyncio
+async def test_open_ports_uses_only_occupied_ports():
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    calls = []
+    deps = _deps(client=client, reports=reports,
+                 run_playbook=_recording_run_playbook(calls))
+
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    names = [n for n, _ in calls]
+    open_calls = [ev for n, ev in calls if n == "open_ports.yml"]
+    assert len(open_calls) == 1
+    ports = open_calls[0]["inbound_ports"]
+    # Ровно порты четырёх domain-free дефолтов, отсортированы, без дублей.
+    assert ports == [443, 2053, 2083, 8443]
+    # Лишних портов из пула фолбэков не уходит (5-й фолбэк 2087/2096 не занят).
+    assert 2087 not in ports and 2096 not in ports
+    # Порты открываем до старта контейнера ноды.
+    assert names.index("open_ports.yml") < names.index("deploy_node.yml")
+
+
+@pytest.mark.asyncio
+async def test_domain_free_set_does_not_open_port_80():
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    calls = []
+    deps = _deps(client=client, reports=reports,
+                 run_playbook=_recording_run_playbook(calls))
+
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    names = [n for n, _ in calls]
+    # 80 нужен только для ACME (issue_cert), которого в domain-free наборе нет.
+    assert "issue_cert.yml" not in names
+    open_ports = [ev["inbound_ports"] for n, ev in calls if n == "open_ports.yml"][0]
+    assert 80 not in open_ports
+
+
+@pytest.mark.asyncio
+async def test_tls_open_ports_excludes_80():
+    reports = []
+    client = _TlsClient([NodeConnState.ONLINE])
+    calls = []
+    # check_domain должен подтвердить совпадение, иначе сертификат не выпустим.
+    from orchestrator import domain
+
+    async def check_domain(domain_name, expected_ip):
+        return domain.DomainCheck(ok=True, detail="ok", resolved=[expected_ip])
+
+    deps = _deps(client=client, reports=reports,
+                 run_playbook=_recording_run_playbook(calls),
+                 check_domain=check_domain)
+
+    await tasks.provision_node(
+        {"deps": deps},
+        _payload(inbounds=["vless-xhttp-tls"], tls_domain="vpn.example.com"),
+    )
+
+    names = [n for n, _ in calls]
+    open_ports = [ev["inbound_ports"] for n, ev in calls if n == "open_ports.yml"][0]
+    # 80 открывает issue_cert.yml, в open_ports его не дублируем.
+    assert "issue_cert.yml" in names
+    assert open_ports == [443]
+    assert 80 not in open_ports

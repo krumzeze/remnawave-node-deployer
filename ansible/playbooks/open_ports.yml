@@ -1,0 +1,31 @@
+---
+# Открыть в UFW порты выбранных inbound'ов.
+# Запускается ПОСЛЕ hardening (там UFW переведён в default deny и разрешён
+# только 22) и ДО того, как нода начинает принимать трафик: иначе клиентские
+# подключения к inbound'ам упрутся в политику deny. remnanode идёт с
+# network_mode: host, поэтому правила на цепочке INPUT к этим портам реально
+# применяются (классический обход UFW докером тут не срабатывает).
+#
+# Список портов приходит из генератора (GeneratedProfile.ports) — открываем
+# ровно занятые порты, не весь пул фолбэков. Порт 80 для ACME-челленджа
+# открывает issue_cert.yml отдельно и только для TLS-набора — здесь не дублируем.
+- name: Open inbound ports in UFW
+  hosts: all
+  become: true
+  vars:
+    inbound_ports: []          # список портов, передаётся из оркестратора
+  tasks:
+    - name: Require at least one inbound port
+      ansible.builtin.assert:
+        that:
+          - inbound_ports | length > 0
+        fail_msg: "inbound_ports пуст — нечего открывать"
+
+    # Все шесть пунктов меню (ADR 0005) — TCP-транспорты (Reality TCP/xHTTP/gRPC,
+    # TLS xHTTP/WS, Shadowsocks-2022 поверх tcp), поэтому открываем tcp.
+    - name: Allow selected inbound ports (tcp)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item | string }}"
+        proto: tcp
+      loop: "{{ inbound_ports }}"
