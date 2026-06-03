@@ -105,3 +105,99 @@ def test_build_payload_carries_tls_domain():
     }
     payload = handlers.build_payload(data, node_id=1, chat_id=1)
     assert payload["tls_domain"] == "vpn.example.com"
+
+
+@pytest.mark.parametrize(
+    "inbounds, expected",
+    [
+        (None, True),                                  # «все» — дефолт с Reality
+        ([], True),
+        ([InboundChoice.VLESS_REALITY_TCP.value], True),
+        ([InboundChoice.VLESS_GRPC_REALITY.value], True),
+        ([InboundChoice.SHADOWSOCKS.value], False),    # SS не Reality
+        ([InboundChoice.VLESS_XHTTP_TLS.value], False),  # TLS не Reality
+        ([InboundChoice.SHADOWSOCKS.value,
+          InboundChoice.VLESS_REALITY_TCP.value], True),  # хотя бы один Reality
+    ],
+)
+def test_selection_has_reality(inbounds, expected):
+    assert handlers.selection_has_reality(inbounds) is expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "default", "дефолт", "по умолчанию", "-", "  DEFAULT  "],
+)
+def test_parse_reality_donor_default(text):
+    assert handlers.parse_reality_donor(text) is None
+
+
+@pytest.mark.parametrize(
+    "text, dest, names",
+    [
+        ("www.cloudflare.com", "www.cloudflare.com:443", ["www.cloudflare.com"]),
+        ("www.microsoft.com:443", "www.microsoft.com:443", ["www.microsoft.com"]),
+        ("https://example.com/path", "example.com:443", ["example.com"]),
+        ("EXAMPLE.COM", "example.com:443", ["example.com"]),
+        ("dl.google.com:8443", "dl.google.com:8443", ["dl.google.com"]),
+    ],
+)
+def test_parse_reality_donor_host(text, dest, names):
+    assert handlers.parse_reality_donor(text) == (dest, names)
+
+
+@pytest.mark.parametrize("text", ["not a domain", "localhost", "host:notaport"])
+def test_parse_reality_donor_invalid_raises(text):
+    with pytest.raises(ValueError):
+        handlers.parse_reality_donor(text)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [("", None), ("skip", None), ("пропустить", None), ("-", None),
+     ("nl", "NL"), ("DE", "DE"), ("  us  ", "US")],
+)
+def test_parse_country_code_ok(text, expected):
+    assert handlers.parse_country_code(text) == expected
+
+
+@pytest.mark.parametrize("text", ["n", "nld", "n1", "12", "россия"])
+def test_parse_country_code_invalid_raises(text):
+    with pytest.raises(ValueError):
+        handlers.parse_country_code(text)
+
+
+def test_build_payload_carries_reality_donor_and_country():
+    data = {
+        "panel_mode": "existing",
+        "panel_url": "https://p",
+        "ip": "1.2.3.4",
+        "login": "root",
+        "auth": "key",
+        "private_key": "PRIVKEY",
+        "inbounds": None,
+        "reality_dest": "www.cloudflare.com:443",
+        "reality_server_names": ["www.cloudflare.com"],
+        "country_code": "NL",
+    }
+    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    assert payload["reality_dest"] == "www.cloudflare.com:443"
+    assert payload["reality_server_names"] == ["www.cloudflare.com"]
+    assert payload["country_code"] == "NL"
+
+
+def test_build_payload_omits_reality_donor_and_country_when_absent():
+    data = {
+        "panel_mode": "existing",
+        "panel_url": "https://p",
+        "ip": "1.2.3.4",
+        "login": "root",
+        "auth": "key",
+        "private_key": "PRIVKEY",
+        "inbounds": None,
+    }
+    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    # Не задано → в payload не кладём, воркер подставит дефолты (донор/«XX»).
+    assert "reality_dest" not in payload
+    assert "reality_server_names" not in payload
+    assert "country_code" not in payload

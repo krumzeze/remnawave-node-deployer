@@ -269,8 +269,19 @@ class _Pipeline:
         # Профиль собираем здесь, до deploy_node: из него берём раскладку портов,
         # чтобы открыть их в UFW прежде, чем нода начнёт принимать трафик. Сам
         # config уйдёт в панель ниже, на шаге REGISTERING.
+        #
+        # Донор Reality — per-node (ADR 0007): если оператор задал его в диалоге,
+        # берём из payload, иначе дефолт генератора (иностранный сайт для ноды за
+        # границей). server_names в payload приходит списком — приводим к кортежу.
+        reality_dest = self.p.get("reality_dest") or xray_config.DEFAULT_REALITY_DEST
+        reality_server_names = tuple(
+            self.p.get("reality_server_names")
+            or xray_config.DEFAULT_REALITY_SERVER_NAMES
+        )
         generated = self.deps.build_profile(
             choices,
+            reality_dest=reality_dest,
+            reality_server_names=reality_server_names,
             tls_domain=tls_domain,
             cert_file=cert_file,
             key_file=key_file,
@@ -409,7 +420,8 @@ async def provision_node(ctx: dict, payload: dict) -> None:
 
     payload (из FSM-диалога бота): ip, login, auth (password|key) и либо password,
     либо private_key; node_id и chat_id для отчётности; опционально
-    panel_url/panel_token, inbounds, country_code, tls_domain.
+    panel_url/panel_token, inbounds, country_code, tls_domain,
+    reality_dest/reality_server_names (донор Reality, ADR 0007).
     Пароль живёт только в payload задачи и стирается в bootstrap; в БД он не пишется.
 
     Зависимости берутся из ctx["deps"] (ProvisionDeps) — это путь тестов; в проде
@@ -436,6 +448,8 @@ async def _worker_shutdown(ctx: dict) -> None:
 
 
 class WorkerSettings:
+    """Конфиг arq-воркера: какие задачи обслуживаем и хуки жизненного цикла."""
+
     functions = [provision_node]
     on_startup = _worker_startup
     on_shutdown = _worker_shutdown

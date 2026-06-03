@@ -162,6 +162,57 @@ async def test_default_inbounds_are_domain_free():
 
 
 @pytest.mark.asyncio
+async def test_reality_donor_and_country_reach_pipeline():
+    # Донор Reality и код страны из payload (ADR 0007) доходят до генератора и
+    # регистрации ноды соответственно.
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    profile_calls = {}
+
+    def build_profile(choices, **kw):
+        profile_calls.update(kw)
+        return _generated([c.value for c in choices])
+
+    deps = _deps(client=client, reports=reports, build_profile=build_profile)
+    await tasks.provision_node(
+        {"deps": deps},
+        _payload(
+            reality_dest="www.cloudflare.com:443",
+            reality_server_names=["www.cloudflare.com"],
+            country_code="NL",
+        ),
+    )
+
+    assert profile_calls["reality_dest"] == "www.cloudflare.com:443"
+    assert profile_calls["reality_server_names"] == ("www.cloudflare.com",)
+    assert client.create_node_kwargs["country_code"] == "NL"
+
+
+@pytest.mark.asyncio
+async def test_reality_donor_defaults_when_absent():
+    # Донор не задан → генератор получает дефолт; страна не задана → "XX".
+    from orchestrator import xray_config
+
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    profile_calls = {}
+
+    def build_profile(choices, **kw):
+        profile_calls.update(kw)
+        return _generated([c.value for c in choices])
+
+    deps = _deps(client=client, reports=reports, build_profile=build_profile)
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    assert profile_calls["reality_dest"] == xray_config.DEFAULT_REALITY_DEST
+    assert (
+        profile_calls["reality_server_names"]
+        == xray_config.DEFAULT_REALITY_SERVER_NAMES
+    )
+    assert client.create_node_kwargs["country_code"] == "XX"
+
+
+@pytest.mark.asyncio
 async def test_vault_put_called_with_key_not_password():
     reports = []
     stored = {}

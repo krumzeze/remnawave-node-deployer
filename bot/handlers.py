@@ -25,7 +25,7 @@ from bot.states import AddNode
 from config import settings
 from orchestrator import domain
 from orchestrator.ssh_bootstrap import _generate_keypair
-from orchestrator.xray_config import TLS_CHOICES, InboundChoice
+from orchestrator.xray_config import REALITY_CHOICES, TLS_CHOICES, InboundChoice
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -55,6 +55,65 @@ def selection_needs_domain(inbounds: list[str] | None) -> bool:
         return False
     tls_values = {c.value for c in TLS_CHOICES}
     return any(v in tls_values for v in inbounds)
+
+
+def selection_has_reality(inbounds: list[str] | None) -> bool:
+    """Есть ли среди выбранного Reality-инбаунд — только им нужен донор (ADR 0007).
+
+    None («все/по умолчанию») считаем содержащим Reality: дефолтный набор воркера
+    domain-free и почти весь на Reality, так что донор спросить уместно. Для
+    набора без Reality (например только Shadowsocks/TLS) шаг донора пропускаем."""
+    if not inbounds:
+        return True
+    reality_values = {c.value for c in REALITY_CHOICES}
+    return any(v in reality_values for v in inbounds)
+
+
+# Код страны ноды: ровно две буквы (ISO 3166-1 alpha-2). Существование кода не
+# проверяем — панели важен формат, на UX-уровне этого достаточно.
+_COUNTRY_RE = re.compile(r"^[a-z]{2}$")
+
+
+def parse_reality_donor(text: str) -> tuple[str, list[str]] | None:
+    """Разобрать ввод донора Reality (ADR 0007).
+
+    Пусто / «default» → None: воркер подставит дефолт (www.microsoft.com). Иначе
+    из хоста собираем (dest «host:443», server_names [host]); порт можно задать
+    явно через двоеточие. Некорректный хост/порт → ValueError (для понятного
+    переспроса в диалоге)."""
+    raw = (text or "").strip().lower()
+    if raw in ("", "default", "дефолт", "по умолчанию", "-"):
+        return None
+
+    s = raw
+    for prefix in ("https://", "http://"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+    s = s.split("/", 1)[0]                 # отрезаем путь, если вставили URL
+    host, sep, port = s.partition(":")
+    host = domain.normalize_domain(host)
+    if not domain.is_valid_domain(host):
+        raise ValueError(host or s)
+    if sep:
+        if not port.isdigit():
+            raise ValueError(s)
+        dest = f"{host}:{port}"
+    else:
+        dest = f"{host}:443"
+    return dest, [host]
+
+
+def parse_country_code(text: str) -> str | None:
+    """Разобрать код страны ноды для create_node.
+
+    Пусто / «skip» → None: воркер подставит «XX». Две буквы → код в верхнем
+    регистре. Иначе ValueError."""
+    raw = (text or "").strip().lower()
+    if raw in ("", "skip", "пропустить", "-"):
+        return None
+    if not _COUNTRY_RE.match(raw):
+        raise ValueError(raw)
+    return raw.upper()
 
 
 # Пул arq на процесс бота. Создаётся лениво при первой постановке задачи.
@@ -120,7 +179,65 @@ def build_payload(data: dict, *, node_id: int, chat_id: int) -> dict:
         payload["inbounds"] = data["inbounds"]
     if data.get("tls_domain"):
         payload["tls_domain"] = data["tls_domain"]
+    # Донор Reality per-node (ADR 0007). Не задан → не кладём, воркер возьмёт
+    # дефолт. dest и server_names идут парой.
+    if data.get("reality_dest"):
+        payload["reality_dest"] = data["reality_dest"]
+        payload["reality_server_names"] = data.get("reality_server_names", [])
+    if data.get("country_code"):
+        payload["country_code"] = data["country_code"]
     return payload
+
+
+def _reality_prompt() -> str:
+    return (
+        "Сайт-донор для маскировки Reality (ADR 0007).\n"
+        "Для ноды за границей нужен иностранный сайт на TLS1.3+H2, доступный из "
+        "РФ: отечественный SNI (vk/yandex) на зарубежном IP, наоборот, выдаёт "
+        "соединение DPI.\n"
+        "Введи домен донора (например www.cloudflare.com) или напиши default "
+        "для www.microsoft.com."
+    )
+
+
+def _country_prompt() -> str:
+    return (
+        "Код страны ноды (ISO-2, например NL, DE, US) — показывается в панели.\n"
+        "Можно пропустить — напиши skip."
+    )
+
+
+def _confirm_summary(data: dict) -> str:
+    """Сводка перед запуском: что именно уйдёт воркеру."""
+    inbounds = data.get("inbounds")
+    chosen = "все" if not inbounds else ", ".join(inbounds)
+    lines = [f"Inbound'ы: {chosen}."]
+    if selection_has_reality(inbounds):
+        dest = data.get("reality_dest")
+        lines.append(
+            f"Донор Reality: {dest if dest else 'www.microsoft.com (по умолчанию)'}."
+        )
+    cc = data.get("country_code")
+    lines.append(f"Страна: {cc if cc else 'XX (не указана)'}.")
+    if data.get("tls_domain"):
+        lines.append(f"Домен: {data['tls_domain']}.")
+    lines.append("\nЗапустить? Напиши: ok")
+    return "\n".join(lines)
+
+
+async def _go_donor_step(message: Message, state: FSMContext, data: dict) -> None:
+    """После выбора inbound'ов (и домена для TLS) — спросить донор Reality, если
+    среди выбранного он нужен, иначе сразу перейти к коду страны."""
+    if selection_has_reality(data.get("inbounds")):
+        await state.set_state(AddNode.wait_reality_dest)
+        await message.answer(_reality_prompt())
+    else:
+        await _go_country_step(message, state)
+
+
+async def _go_country_step(message: Message, state: FSMContext) -> None:
+    await state.set_state(AddNode.wait_country)
+    await message.answer(_country_prompt())
 
 
 async def _get_queue() -> ArqRedis:
@@ -258,7 +375,8 @@ async def choose_inbounds(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(inbounds=inbounds)
 
-    # TLS-инбаунд требует домена (ADR 0005) — уводим на шаг ввода домена.
+    # TLS-инбаунд требует домена (ADR 0005) — уводим на шаг ввода домена. Дальше
+    # (домен или сразу) — донор Reality и код страны, затем подтверждение.
     if selection_needs_domain(inbounds):
         await state.set_state(AddNode.wait_domain)
         await message.answer(
@@ -267,9 +385,7 @@ async def choose_inbounds(message: Message, state: FSMContext) -> None:
         )
         return
 
-    await state.set_state(AddNode.confirm)
-    chosen = "все" if inbounds is None else ", ".join(inbounds)
-    await message.answer(f"Inbound'ы: {chosen}.\nЗапустить? Напиши: ok")
+    await _go_donor_step(message, state, {"inbounds": inbounds})
 
 
 @router.message(AddNode.wait_domain)
@@ -279,25 +395,53 @@ async def wait_domain(message: Message, state: FSMContext) -> None:
         await message.answer("Не похоже на домен. Введи, например, vpn.example.com.")
         return
     await state.update_data(tls_domain=domain_name)
-    await state.set_state(AddNode.confirm)
 
     data = await state.get_data()
-    inbounds = data.get("inbounds")
-    chosen = "все" if not inbounds else ", ".join(inbounds)
     ip = data.get("ip", "<IP ноды>")
     # Generic-инструкция A-записи (registrar-agnostic, ADR 0005): саму запись
     # создаёт оператор у своего регистратора, мы лишь говорим, что нужно. Перед
     # выпуском сертификата воркер сам проверит, что домен уже указывает на ноду.
+    # Финального «ok» здесь нет: дальше ещё спросим донор/страну, а подтверждение
+    # запуска соберётся на шаге confirm.
     await message.answer(
-        f"Inbound'ы: {chosen}.\n"
         f"Домен: {domain_name}.\n\n"
         "Создай у регистратора A-запись:\n"
         f"<code>{domain_name} → {ip}</code>\n"
         "и дождись, пока она применится. Перед выпуском сертификата я проверю, "
-        "что домен резолвится на ноду.\n\n"
-        "Когда A-запись создана — напиши: ok",
+        "что домен резолвится на ноду.",
         parse_mode="HTML",
     )
+    await _go_donor_step(message, state, data)
+
+
+@router.message(AddNode.wait_reality_dest)
+async def wait_reality_dest(message: Message, state: FSMContext) -> None:
+    try:
+        donor = parse_reality_donor(message.text or "")
+    except ValueError:
+        await message.answer(
+            "Не похоже на домен. Введи хост донора (например www.cloudflare.com) "
+            "или напиши default."
+        )
+        return
+    if donor is not None:
+        dest, server_names = donor
+        await state.update_data(reality_dest=dest, reality_server_names=server_names)
+    await _go_country_step(message, state)
+
+
+@router.message(AddNode.wait_country)
+async def wait_country(message: Message, state: FSMContext) -> None:
+    try:
+        code = parse_country_code(message.text or "")
+    except ValueError:
+        await message.answer("Нужен код из двух букв (например NL) или skip.")
+        return
+    if code is not None:
+        await state.update_data(country_code=code)
+    await state.set_state(AddNode.confirm)
+    data = await state.get_data()
+    await message.answer(_confirm_summary(data))
 
 
 @router.message(AddNode.confirm, F.text.lower() == "ok")

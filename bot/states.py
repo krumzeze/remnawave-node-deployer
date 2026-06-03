@@ -25,4 +25,8 @@ class AddNode(StatesGroup):
     choose_inbounds = State()
     wait_domain = State()      # только если выбран TLS-инбаунд: домен оператора
 
+    # Параметры профиля
+    wait_reality_dest = State()  # донор Reality per-node (ADR 0007); есть дефолт
+    wait_country = State()       # код страны ноды (ISO-2) для create_node
+
     confirm = State()
