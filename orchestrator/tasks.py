@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable
 from arq.connections import RedisSettings
 
 from config import settings
-from orchestrator import ansible_runner, ssh_bootstrap, xray_config
+from orchestrator import ansible_runner, reporting, ssh_bootstrap, xray_config
 from orchestrator.remnawave_client import NodeConnState, RemnawaveClient
 from orchestrator.statemachine import NodeState, can_transition
 from orchestrator.xray_config import InboundChoice
@@ -265,21 +265,79 @@ class _Pipeline:
         await self.deps.report(NodeState.FAILED, detail)
 
 
+def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
+    """Собрать боевые зависимости для одной задачи.
+
+    В дефолтном ProvisionDeps боевые уже все швы, кроме двух, которым нужен
+    контекст задачи и внешние сервисы: `report` (привязан к node_id/chat_id,
+    пишет в БД и шлёт в Telegram) и `vault_put` (приватный ключ → Vault). Их и
+    достраиваем здесь.
+
+    Bot и фабрика сессий берутся из ctx воркера (см. WorkerSettings.on_startup),
+    node_id/chat_id — из payload, поставленного ботом.
+    """
+    from db import get_sessionmaker
+    from db.repo import record_status
+    from secretstore.vault import VaultStore
+
+    node_id = payload.get("node_id")
+    chat_id = payload.get("chat_id")
+    bot = ctx.get("bot")
+
+    if node_id is None:
+        # Без node_id обновлять в БД нечего — оставляем лог-заглушку.
+        return ProvisionDeps(vault_put=VaultStore().put)
+
+    session_factory = get_sessionmaker()
+
+    async def persist(nid: int, state: str, detail: str) -> None:
+        await record_status(session_factory, nid, state, detail)
+
+    notify = None
+    if bot is not None:
+        async def notify(cid: int, text: str) -> None:  # noqa: F811
+            await bot.send_message(cid, text)
+
+    report = reporting.make_reporter(
+        node_id, chat_id, persist=persist, notify=notify
+    )
+    return ProvisionDeps(report=report, vault_put=VaultStore().put)
+
+
 async def provision_node(ctx: dict, payload: dict) -> None:
     """Полный цикл провижининга ноды.
 
     payload (из FSM-диалога бота): ip, login, auth (password|key) и либо password,
-    либо private_key; опционально panel_url/panel_token, inbounds, country_code,
-    tls_domain/cert_file/key_file. Пароль живёт только в payload задачи и стирается
-    в bootstrap; в БД он не пишется.
+    либо private_key; node_id и chat_id для отчётности; опционально
+    panel_url/panel_token, inbounds, country_code, tls_domain/cert_file/key_file.
+    Пароль живёт только в payload задачи и стирается в bootstrap; в БД он не пишется.
 
-    Зависимости берутся из ctx["deps"] (ProvisionDeps), по умолчанию — боевые.
+    Зависимости берутся из ctx["deps"] (ProvisionDeps) — это путь тестов; в проде
+    их там нет, и собираются боевые через build_production_deps.
     """
-    deps = ctx.get("deps") or ProvisionDeps()
+    deps = ctx.get("deps") or build_production_deps(ctx, payload)
     await _Pipeline(payload, deps).execute()
+
+
+async def _worker_startup(ctx: dict) -> None:
+    """Поднять общие на воркер ресурсы: Telegram-бот и таблицы БД."""
+    from aiogram import Bot
+
+    from db import init_models
+
+    ctx["bot"] = Bot(token=settings.bot_token)
+    await init_models()
+
+
+async def _worker_shutdown(ctx: dict) -> None:
+    bot = ctx.get("bot")
+    if bot is not None:
+        await bot.session.close()
 
 
 class WorkerSettings:
     functions = [provision_node]
+    on_startup = _worker_startup
+    on_shutdown = _worker_shutdown
     redis_settings = RedisSettings(host=settings.redis_host,
                                    port=settings.redis_port)

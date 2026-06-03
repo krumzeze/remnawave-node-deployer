@@ -33,3 +33,4 @@ pydantic-settings>=2.2
 # Dev / tests
 pytest>=8.0
 pytest-asyncio>=0.23
+aiosqlite>=0.19        # sqlite-движок для тестов db.repo без postgres
