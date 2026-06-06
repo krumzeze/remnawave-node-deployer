@@ -27,6 +27,13 @@ from orchestrator.xray_config import TLS_CHOICES, InboundChoice
 
 logger = logging.getLogger(__name__)
 
+
+def _panel_name(ip: str) -> str:
+    """Имя для панели из IP. Панель валидирует имена по `^[A-Za-z0-9_\\s-]+$`,
+    точки в IP под этот паттерн не подходят — заменяем их на дефис, чтобы
+    получить, например, `node-2-26-67-180`."""
+    return "node-" + ip.replace(".", "-")
+
 # Порт, на котором слушает контейнер remnanode (APP_PORT) и который мы же
 # регистрируем в панели через create_node. Значение одно: панель должна
 # стучаться ровно туда, куда нода слушает. 2222 — дефолт образа remnawave/node.
@@ -383,7 +390,7 @@ class _Pipeline:
         await self._advance(NodeState.REGISTERING, "Регистрирую ноду в панели")
 
         # Панель сама присваивает inbound'ам uuid'ы; связываем по тегам (ADR 0006).
-        profile = await client.create_config_profile(f"node-{ip}", generated.config)
+        profile = await client.create_config_profile(_panel_name(ip), generated.config)
         active_inbounds = [
             profile.tag_to_inbound[tag]
             for tag in generated.tags
@@ -393,7 +400,7 @@ class _Pipeline:
             raise ProvisionError("панель не вернула ни одного inbound по нашим тегам")
 
         node = await client.create_node(
-            name=f"node-{ip}",
+            name=_panel_name(ip),
             address=ip,
             config_profile_uuid=profile.uuid,
             active_inbounds=active_inbounds,
