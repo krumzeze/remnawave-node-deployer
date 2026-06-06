@@ -5,6 +5,10 @@ aiogram>=3.7,<4
 asyncssh>=2.14
 
 # Config management
+# ansible-runner только вызывает внешний ansible-playbook, поэтому нужен сам
+# ansible. Берём пакет с батарейками: в нём есть community.general (ufw) и
+# community.docker (docker_compose_v2), которые используют плейбуки.
+ansible>=10,<12
 ansible-runner>=2.3
 
 # Remnawave API
