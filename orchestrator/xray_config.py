@@ -125,6 +125,10 @@ class GeneratedProfile:
     ports: dict[str, int] = field(default_factory=dict)
     # Подсказки для заведения host'ов: tag→HostHint (ADR 0008).
     hosts: dict[str, HostHint] = field(default_factory=dict)
+    # Порты, которые слушаются ещё и по UDP (Shadowsocks). Держим отдельным
+    # списком, а не вычисляем из тегов: теги теперь несут per-node суффикс, и
+    # сравнивать их со значением InboundChoice больше нельзя.
+    udp_ports: list[int] = field(default_factory=list)
 
 
 # Раскладка транспорта/безопасности по пунктам меню: из неё строятся host'ы.
@@ -339,6 +343,7 @@ def build_profile(
     cert_file: str | None = None,
     key_file: str | None = None,
     port_overrides: dict[InboundChoice, int] | None = None,
+    tag_suffix: str = "",
 ) -> GeneratedProfile:
     """Собрать полный Xray-конфиг под выбранные inbound'ы.
 
@@ -346,6 +351,11 @@ def build_profile(
     пустой выбор блокируется ещё в UI, но проверяем и здесь). Для TLS-вариантов
     обязателен tls_domain и пути к сертификату; для Reality-вариантов ключи
     генерируются автоматически — каждый Reality-inbound получает свою пару.
+
+    tag_suffix делает теги инбаундов уникальными в пределах всей панели (она
+    отвергает дубль тега с 409). Передаём сюда стабильный per-node идентификатор
+    (например, slug IP) — иначе вторая нода ловит «Inbounds with same tag already
+    exists», т.к. набор пунктов меню у всех нод одинаков.
     """
     if not choices:
         raise ValueError("список inbound'ов пуст: нужен хотя бы один")
@@ -367,6 +377,7 @@ def build_profile(
     reality_keys: dict[str, RealityKeys] = {}
     ports_by_tag: dict[str, int] = {}
     hosts: dict[str, HostHint] = {}
+    udp_ports: list[int] = []
 
     for choice in ordered:
         keys = generate_reality_keys() if choice in REALITY_CHOICES else None
@@ -376,16 +387,25 @@ def build_profile(
             dest=reality_dest, server_names=list(reality_server_names),
             tls_domain=tls_domain, cert_file=cert_file, key_file=key_file,
         )
+        # Тег обязан быть уникальным в пределах всей панели — добавляем per-node
+        # суффикс. Базовый тег (= значению пункта меню) при этом сохраняется как
+        # префикс, чтобы оставаться читаемым в UI панели.
+        tag = inbound["tag"]
+        if tag_suffix:
+            tag = f"{tag}-{tag_suffix}"
+            inbound["tag"] = tag
         inbounds.append(inbound)
-        tags.append(inbound["tag"])
-        ports_by_tag[inbound["tag"]] = ports[choice]
-        hosts[inbound["tag"]] = _host_hint(
+        tags.append(tag)
+        ports_by_tag[tag] = ports[choice]
+        hosts[tag] = _host_hint(
             choice,
             server_names=list(reality_server_names),
             tls_domain=tls_domain,
         )
+        if choice is InboundChoice.SHADOWSOCKS:
+            udp_ports.append(ports[choice])
         if keys is not None:
-            reality_keys[inbound["tag"]] = keys
+            reality_keys[tag] = keys
 
     config = {
         "log": {"loglevel": "warning"},
@@ -399,5 +419,5 @@ def build_profile(
 
     return GeneratedProfile(
         config=config, tags=tags, reality_keys=reality_keys, ports=ports_by_tag,
-        hosts=hosts,
+        hosts=hosts, udp_ports=udp_ports,
     )

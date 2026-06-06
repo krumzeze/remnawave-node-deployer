@@ -8,23 +8,70 @@
     remnanode_secret_key: ""   # передаётся из оркестратора
     remnanode_port: 0
     cert_dir_host: /opt/remnanode/certs
+    # ansible_architecture → имя архитектуры в apt-репозитории Docker.
+    docker_arch_map:
+      x86_64: amd64
+      aarch64: arm64
   tasks:
-    # curl нужен установщику Docker ниже; на голой Ubuntu его может не быть.
-    - name: Install curl (needed by Docker convenience script)
+    # Docker ставим из официального apt-репозитория, а не через «curl | sh».
+    # Convenience-скрипт при уже установленном Docker (часть облачных образов
+    # идёт с предустановленным docker.io, плюс повторный прогон) просто выходит,
+    # ничего не доставляя, поэтому docker-compose-plugin не появляется и
+    # docker_compose_v2 падает на «Up remnanode» с «does not have the compose
+    # plugin». apt-установка идемпотентна и доустанавливает плагин compose даже
+    # на таких образах (ср. перевод acme.sh на git clone по той же причине).
+    - name: Install Docker apt prerequisites
       ansible.builtin.apt:
-        name: curl
+        name:
+          - ca-certificates
+          - curl
         state: present
         update_cache: true
 
-    # pipefail обязателен: без него падение curl маскируется нулевым кодом sh
-    # справа от пайпа, шаг «успешен», а docker не установлен.
-    - name: Install Docker via official convenience script
-      ansible.builtin.shell: |
-        set -euo pipefail
-        curl -fsSL https://get.docker.com | sh
-      args:
-        executable: /bin/bash
-        creates: /usr/bin/docker
+    - name: Create apt keyrings dir
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    # Кодовое имя релиза берём из фактов; bootstrap уже отбраковал не-Ubuntu и
+    # не-KVM, так что это jammy/noble. Архитектуру мапим в имя репозитория.
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ docker_arch_map[ansible_architecture] | default(ansible_architecture) }}
+          signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+
+    - name: Install Docker Engine and Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    # Convenience-скрипт стартовал и включал docker сам; apt-установка этого не
+    # гарантирует — демон может остаться не поднятым, и docker_compose_v2 упадёт
+    # на «Cannot connect to the Docker daemon». Запускаем и ставим в автозапуск,
+    # чтобы нода пережила и перезагрузку сервера.
+    - name: Ensure Docker service is running and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
 
     # Порт, на котором контейнер ноды слушает панель (APP_PORT). hardening
     # оставил default deny + только 22, поэтому без этого правила управляющее

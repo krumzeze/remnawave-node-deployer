@@ -69,6 +69,53 @@ def _cert_paths(domain_name: str) -> tuple[str, str]:
     return f"{base}/fullchain.pem", f"{base}/key.pem"
 
 
+# Имена host'ов, которые пользователь видит в подписке (ADR 0008). Формат
+# remark — «<флаг> <страна> · <Отпечаток>», например «🇳🇱 Нидерланды · Firefox»:
+# флаг и название страны выводим из ISO-2 кода ноды, отпечаток — uTLS-fingerprint
+# инбаунда. Имя самой ноды в панели при этом не трогаем — это отдельная сущность.
+HOST_REMARK_MAXLEN = 40
+
+# RU-названия стран по ISO-2. Таблица не претендует на полноту: покрывает
+# частые для VPS направления, для остального фолбэк — сам код (лучше пустоты).
+_COUNTRY_NAMES_RU: dict[str, str] = {
+    "NL": "Нидерланды", "DE": "Германия", "FR": "Франция", "GB": "Великобритания",
+    "US": "США", "CA": "Канада", "FI": "Финляндия", "SE": "Швеция",
+    "NO": "Норвегия", "PL": "Польша", "CZ": "Чехия", "AT": "Австрия",
+    "CH": "Швейцария", "IT": "Италия", "ES": "Испания", "PT": "Португалия",
+    "IE": "Ирландия", "BE": "Бельгия", "LU": "Люксембург", "DK": "Дания",
+    "EE": "Эстония", "LV": "Латвия", "LT": "Литва", "RO": "Румыния",
+    "BG": "Болгария", "HU": "Венгрия", "GR": "Греция", "TR": "Турция",
+    "UA": "Украина", "RU": "Россия", "KZ": "Казахстан", "AM": "Армения",
+    "GE": "Грузия", "AE": "ОАЭ", "IL": "Израиль", "IN": "Индия",
+    "SG": "Сингапур", "JP": "Япония", "KR": "Южная Корея", "HK": "Гонконг",
+    "AU": "Австралия", "BR": "Бразилия", "ZA": "ЮАР",
+}
+
+
+def _country_flag(code: str) -> str:
+    """Эмодзи-флаг из ISO-2 через regional indicator symbols (A→🇦 и т.д.).
+    Для некорректного кода (не две латинские буквы) — пустая строка."""
+    code = (code or "").strip().upper()
+    if len(code) != 2 or not code.isalpha() or not code.isascii():
+        return ""
+    return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in code)
+
+
+def _host_remark(country_code: str, fingerprint: str | None) -> str:
+    """Человекочитаемый remark host'а: «<флаг> <страна> · <Отпечаток>».
+
+    Без отпечатка (например, Shadowsocks — там uTLS нет) хвост «· …» опускаем,
+    остаётся «<флаг> <страна>». Для неизвестного кода страны название = сам код.
+    Длину режем под лимит панели (HOST_REMARK_MAXLEN)."""
+    code = (country_code or "XX").strip().upper()
+    name = _COUNTRY_NAMES_RU.get(code, code)
+    flag = _country_flag(code)
+    label = f"{flag} {name}".strip()
+    if fingerprint:
+        label = f"{label} · {fingerprint.capitalize()}"
+    return label[:HOST_REMARK_MAXLEN]
+
+
 class ProvisionError(Exception):
     """Шаг конвейера завершился неуспехом. detail — для отчёта оператору."""
 
@@ -285,13 +332,9 @@ class _Pipeline:
             raise ProvisionError("генератор не вернул портов inbound'ов")
 
         # Shadowsocks слушает ещё и udp (network: tcp,udp в конфиге) — открываем
-        # udp только его порту, остальным inbound'ам udp не нужен. Тег == значению
-        # InboundChoice по построению генератора, поэтому опознаём SS по тегу.
-        udp_ports = sorted(
-            port
-            for tag, port in generated.ports.items()
-            if tag == InboundChoice.SHADOWSOCKS.value
-        )
+        # udp только его порту, остальным inbound'ам udp не нужен. Список udp-портов
+        # отдаёт генератор (теги несут per-node суффикс, опознать SS по тегу нельзя).
+        udp_ports = sorted(set(generated.udp_ports))
 
         await self.deps.report(self.state, f"Открываю порты в UFW: {ports}")
         result = await self.deps.run_playbook(
@@ -361,6 +404,9 @@ class _Pipeline:
             tls_domain=tls_domain,
             cert_file=cert_file,
             key_file=key_file,
+            # Per-node суффикс тегов: панель требует глобально уникальные теги
+            # инбаундов, иначе вторая нода падает с 409 «same tag already exists».
+            tag_suffix=ip.replace(".", "-"),
         )
 
         # hardening поставил default deny + только 22; теперь разрешаем порты
@@ -442,7 +488,7 @@ class _Pipeline:
         дефолт «все сквады панели» (ADR 0008). Инбаунды дописываются к текущему
         составу сквада, существующие узлы не затрагиваются.
         """
-        node_name = f"node-{ip}"
+        country_code = self.p.get("country_code", "XX")
         await self.deps.report(self.state, "Завожу хосты для подписки")
         for tag in generated.tags:
             inbound_uuid = profile.tag_to_inbound.get(tag)
@@ -454,7 +500,9 @@ class _Pipeline:
             await client.create_host(
                 inbound_uuid=inbound_uuid,
                 config_profile_uuid=profile.uuid,
-                remark=f"{node_name}/{tag}"[:40],
+                remark=_host_remark(
+                    country_code, hint.fingerprint if hint else None
+                ),
                 address=address,
                 port=generated.ports[tag],
                 node_uuid=node_uuid,

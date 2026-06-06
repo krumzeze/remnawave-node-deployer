@@ -90,6 +90,7 @@ def _generated(tags):
             security="none" if t == "shadowsocks" else "reality",
             network="tcp",
             sni=None if t == "shadowsocks" else "www.microsoft.com",
+            fingerprint=None if t == "shadowsocks" else "firefox",
         )
         for t in tags
     }
@@ -196,6 +197,9 @@ async def test_publish_creates_hosts_and_links_squads():
     assert created[0]["port"] == 443
     assert created[0]["security"] == "reality"
     assert created[0]["node_uuid"] == "node-uuid"
+    # remark — человекочитаемый: «<флаг> <страна> · <Отпечаток>». Дефолтный
+    # payload без country_code → "XX"; reality-инбаунд несёт fingerprint firefox.
+    assert created[0]["remark"] == "🇽🇽 XX · Firefox"
     # Сквады не заданы в payload → дефолт «все»: добавили во все сквады панели.
     squads, inbounds = client.squads_called
     assert squads == ["sq-1", "sq-2"]
@@ -446,6 +450,22 @@ async def test_poll_timeout_goes_failed():
 
     assert reports[-1] is NodeState.FAILED
     assert NodeState.ONLINE not in reports
+
+
+def test_host_remark_format():
+    # «<флаг> <страна> · <Отпечаток>»; флаг — regional indicators из ISO-2.
+    assert tasks._host_remark("NL", "firefox") == "🇳🇱 Нидерланды · Firefox"
+    # Без отпечатка (Shadowsocks) хвост «· …» опускаем.
+    assert tasks._host_remark("DE", None) == "🇩🇪 Германия"
+    # Неизвестный код: название = сам код, флаг всё равно валиден.
+    assert tasks._host_remark("XX", "firefox") == "🇽🇽 XX · Firefox"
+    # Нижний регистр нормализуется, пустой код → XX.
+    assert tasks._host_remark("nl", None) == "🇳🇱 Нидерланды"
+    assert tasks._host_remark("", None) == "🇽🇽 XX"
+    # Невалидная длина кода — без флага, не падаем.
+    assert tasks._host_remark("BAD", "firefox") == "BAD · Firefox"
+    # Лимит панели соблюдается.
+    assert len(tasks._host_remark("NL", "firefox")) <= tasks.HOST_REMARK_MAXLEN
 
 
 @pytest.mark.asyncio
