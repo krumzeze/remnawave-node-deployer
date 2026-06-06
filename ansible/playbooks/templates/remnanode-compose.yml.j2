@@ -5,11 +5,22 @@ services:
     # имени `remnanode` при автопродлении сертификата. Без этого compose назвал бы
     # контейнер remnanode-remnanode-1 и docker restart не нашёл бы его.
     container_name: remnanode
+    hostname: remnanode
     restart: always
     network_mode: host
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
     environment:
-      SSL_CERT: "{{ remnanode_secret_key }}"
-      APP_PORT: "{{ remnanode_port }}"
+      # Имена переменных задаёт образ remnawave/node (см. compose, который панель
+      # отдаёт при создании ноды): ключ панели — SECRET_KEY, порт — NODE_PORT.
+      # Старые SSL_CERT/APP_PORT актуальный образ не читает: контейнер стартует
+      # без ключа и на дефолтном порту, и панель не может к нему подключиться.
+      SECRET_KEY: "{{ remnanode_secret_key }}"
+      NODE_PORT: "{{ remnanode_port }}"
     volumes:
       # Сертификаты acme.sh (TLS-инбаунды, ADR 0005). Каталог есть всегда; для
       # domain-free набора он просто пустой. Пути сертификата в Xray-конфиге

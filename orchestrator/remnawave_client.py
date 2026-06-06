@@ -165,8 +165,11 @@ def _build_create_host_request(
     """Собрать CreateHostRequestDto. Импорт ленивый — как и у остальных билдеров.
 
     security — доменная строка («reality»/«tls»/«none»/«default»); мапим её на
-    SecurityLayer панели, чтобы выше по стеку не тянуть энумы SDK. Хост ссылается
-    на инбаунд профиля (config_profile_uuid + inbound_uuid); nodes — это лишь
+    SecurityLayer панели, чтобы выше по стеку не тянуть энумы SDK. У панели
+    securityLayer всего три значения: DEFAULT, TLS, NONE. Reality отдельного
+    значения не имеет — он настраивается на инбаунде, а хост наследует его
+    через DEFAULT, поэтому «reality» мапим на DEFAULT. Хост ссылается на
+    инбаунд профиля (config_profile_uuid + inbound_uuid); nodes — это лишь
     визуальная привязка к ноде в UI панели, на доступ она не влияет.
     """
     from uuid import UUID
@@ -175,7 +178,7 @@ def _build_create_host_request(
     from remnawave.models import CreateHostInboundData, CreateHostRequestDto
 
     sec_map = {
-        "reality": SecurityLayer.REALITY,
+        "reality": SecurityLayer.DEFAULT,
         "tls": SecurityLayer.TLS,
         "none": SecurityLayer.NONE,
         "default": SecurityLayer.DEFAULT,
