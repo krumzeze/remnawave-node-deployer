@@ -40,6 +40,43 @@ class PlaybookResult:
     status: str | None = None
 
 
+def _extract_failures(result: Any) -> str:
+    """Собрать причину провала из событий ansible-runner.
+
+    При `quiet=True` сам текст ansible на консоль не идёт, но события остаются
+    в `result.events`. Берём упавшие таски (`runner_on_failed`) и тащим из них
+    имя таска и осмысленное сообщение (`msg`, либо stderr модуля). Без этого
+    наверх уходит только `rc=2`, и реальную причину (например, провал acme.sh)
+    не видно ни в логах, ни в Telegram.
+
+    Всё через getattr/get с дефолтами: на фейковом result в тестах событий нет.
+    """
+    events = getattr(result, "events", None)
+    if not events:
+        return ""
+
+    lines: list[str] = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("event") != "runner_on_failed":
+            continue
+        data = event.get("event_data") or {}
+        task = data.get("task") or "неизвестный таск"
+        res = data.get("res") or {}
+        msg = (
+            res.get("msg")
+            or res.get("stderr")
+            or res.get("module_stderr")
+            or res.get("stdout")
+            or ""
+        )
+        msg = " ".join(str(msg).split())          # схлопываем переносы и хвосты
+        if len(msg) > 500:                         # длинный stderr acme.sh не тащим целиком
+            msg = msg[:500] + "…"
+        lines.append(f"[{task}] {msg}" if msg else f"[{task}]")
+
+    return " | ".join(lines)
+
+
 def _build_inventory(host: str, login: str, port: int) -> str:
     """INI-инвентарь на один хост.
 
@@ -106,10 +143,14 @@ async def run_playbook(
         log.info("playbook %s: ok", name)
         return PlaybookResult(ok=True, detail=f"{name}: успешно", rc=rc, status=status)
 
-    log.warning("playbook %s: rc=%s status=%s", name, rc, status)
+    reason = _extract_failures(result)
+    log.warning("playbook %s: rc=%s status=%s %s", name, rc, status, reason)
+    detail = f"{name}: ansible завершился со статусом {status!r} (rc={rc})"
+    if reason:
+        detail = f"{detail}: {reason}"
     return PlaybookResult(
         ok=False,
-        detail=f"{name}: ansible завершился со статусом {status!r} (rc={rc})",
+        detail=detail,
         rc=rc,
         status=status,
     )

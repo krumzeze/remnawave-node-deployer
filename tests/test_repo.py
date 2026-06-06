@@ -53,6 +53,29 @@ async def test_get_or_create_panel_is_idempotent(sm):
 
 
 @pytest.mark.asyncio
+async def test_get_saved_panel_returns_none_when_absent(sm):
+    assert await repo.get_saved_panel(sm, owner_tg_id=42) is None
+
+
+@pytest.mark.asyncio
+async def test_get_saved_panel_returns_latest_for_owner(sm):
+    await repo.get_or_create_panel(
+        sm, owner_tg_id=1, url="https://old", token_vault_path="panels/1/token"
+    )
+    await repo.get_or_create_panel(
+        sm, owner_tg_id=1, url="https://new", token_vault_path="panels/1/token"
+    )
+    # Чужая панель в выборку не попадает.
+    await repo.get_or_create_panel(
+        sm, owner_tg_id=2, url="https://other", token_vault_path="panels/2/token"
+    )
+
+    panel = await repo.get_saved_panel(sm, owner_tg_id=1)
+    assert panel is not None
+    assert panel.url == "https://new"
+
+
+@pytest.mark.asyncio
 async def test_record_status_updates_node_and_adds_task(sm):
     panel_id = await repo.get_or_create_panel(
         sm, owner_tg_id=1, url="https://p", token_vault_path="t"

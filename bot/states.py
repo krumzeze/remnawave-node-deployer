@@ -34,3 +34,13 @@ class AddNode(StatesGroup):
     choose_squads = State()
 
     confirm = State()
+
+
+class ChangePanel(StatesGroup):
+    """Смена сохранённой панели (команда /panel).
+
+    Панель вводится один раз и переиспользуется на каждом /add (ADR 0003,
+    single-tenant). Этот мини-диалог позволяет задать другую панель, не трогая
+    добавление ноды."""
+    wait_url = State()
+    wait_token = State()

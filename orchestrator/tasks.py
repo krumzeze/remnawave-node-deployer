@@ -95,6 +95,7 @@ class ProvisionDeps:
     )
     make_client: Callable[[str, str], RemnawaveClient] = _default_make_client
     vault_put: Callable[[str, dict], Any] | None = None
+    vault_get: Callable[[str], dict] | None = None
     report: Callable[[NodeState, str], Awaitable[None]] = _noop_report
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_attempts: int = POLL_ATTEMPTS
@@ -133,12 +134,49 @@ class _Pipeline:
         except ValueError as exc:
             raise ProvisionError(f"неизвестный inbound в payload: {exc}") from exc
 
+    def _load_stored_key(self, ip: str) -> str | None:
+        """Достать ранее сохранённый приватный ключ ноды из Vault.
+
+        Ключ туда кладёт `_store_key` после первого успешного bootstrap. Если
+        Vault недоступен, пути нет или ключ пуст — возвращаем None и идём по
+        обычной развилке. Любая ошибка чтения не должна ронять провижн, поэтому
+        ловим широко."""
+        if self.deps.vault_get is None:
+            return None
+        try:
+            data = self.deps.vault_get(f"nodes/{ip}/ssh")
+        except Exception:  # noqa: BLE001 — нет ключа/Vault недоступен → просто без resume
+            return None
+        key = (data or {}).get("private_key")
+        return key or None
+
     async def _bootstrap(self) -> str:
-        """Детекция + перевод сервера на ключ. Возвращает приватный ключ."""
+        """Детекция + перевод сервера на ключ. Возвращает приватный ключ.
+
+        Resume (ADR 0002, «не навреди»): если для этого IP уже есть ключ в Vault
+        (прошлый bootstrap прошёл), сервер уже переведён на ключ и пароль на нём,
+        скорее всего, отключён. Тогда заходим сохранённым ключом и пропускаем
+        перевод на ключ — это и делает повторный провижн (ретрай после сбоя на
+        более позднем шаге) самодостаточным: пароль вводить повторно не нужно.
+        Ключ перед использованием проверяется внутри bootstrap_key; если не
+        подошёл — откатываемся на заданный в payload способ доступа."""
         ip = self.p["ip"]
         login = self.p["login"]
         auth = self.p["auth"]
         await self._advance(NodeState.BOOTSTRAPPING, f"Подключаюсь к {ip} ({auth})")
+
+        stored_key = self._load_stored_key(ip)
+        if stored_key:
+            await self.deps.report(
+                self.state, "Нашёл сохранённый ключ ноды — захожу по нему"
+            )
+            result = await self.deps.bootstrap_key(ip, login, stored_key)
+            if result.ok and result.private_key:
+                return result.private_key
+            await self.deps.report(
+                self.state,
+                "Сохранённый ключ не подошёл — пробую заданный способ доступа",
+            )
 
         if auth == "password":
             result = await self.deps.bootstrap_password(
@@ -454,9 +492,10 @@ def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
     chat_id = payload.get("chat_id")
     bot = ctx.get("bot")
 
+    vault = VaultStore()
     if node_id is None:
         # Без node_id обновлять в БД нечего — оставляем лог-заглушку.
-        return ProvisionDeps(vault_put=VaultStore().put)
+        return ProvisionDeps(vault_put=vault.put, vault_get=vault.get)
 
     session_factory = get_sessionmaker()
 
@@ -471,7 +510,7 @@ def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
     report = reporting.make_reporter(
         node_id, chat_id, persist=persist, notify=notify
     )
-    return ProvisionDeps(report=report, vault_put=VaultStore().put)
+    return ProvisionDeps(report=report, vault_put=vault.put, vault_get=vault.get)
 
 
 async def provision_node(ctx: dict, payload: dict) -> None:

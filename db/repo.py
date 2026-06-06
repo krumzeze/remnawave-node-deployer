@@ -61,6 +61,24 @@ async def get_or_create_panel(
         return panel.id
 
 
+async def get_saved_panel(
+    session_factory: async_sessionmaker, owner_tg_id: int
+) -> Panel | None:
+    """Последняя сохранённая панель владельца, либо None.
+
+    Нужна боту, чтобы не спрашивать URL/токен на каждом /add: single-tenant
+    (ADR 0003), панель у владельца обычно одна. Берём самую свежую — на случай,
+    если оператор сменил панель через /panel (добавится новая запись с тем же
+    owner). Сам токен лежит в Vault по token_vault_path, тут только метаданные.
+    """
+    async with session_factory() as session:
+        return await session.scalar(
+            select(Panel)
+            .where(Panel.owner_tg_id == owner_tg_id)
+            .order_by(Panel.created_at.desc(), Panel.id.desc())
+        )
+
+
 async def create_node_record(
     session_factory: async_sessionmaker,
     *,

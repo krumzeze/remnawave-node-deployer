@@ -325,6 +325,87 @@ async def test_vault_put_called_with_key_not_password():
 
 
 @pytest.mark.asyncio
+async def test_resume_uses_stored_key_skips_password():
+    # Если в Vault уже есть ключ ноды — заходим им, пароль не трогаем.
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    pw_calls = []
+    key_calls = []
+
+    async def bootstrap_password(ip, login, password):
+        pw_calls.append(ip)
+        return BootstrapResult(ok=True, private_key="PRIVKEY")
+
+    async def bootstrap_key(ip, login, private_key):
+        key_calls.append(private_key)
+        return BootstrapResult(ok=True, private_key=private_key)
+
+    def vault_get(path):
+        assert path == "nodes/1.2.3.4/ssh"
+        return {"private_key": "STORED"}
+
+    deps = _deps(
+        client=client, reports=reports,
+        bootstrap_password=bootstrap_password, bootstrap_key=bootstrap_key,
+        vault_get=vault_get,
+    )
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    assert key_calls == ["STORED"]   # зашли сохранённым ключом
+    assert pw_calls == []            # пароль не использовали
+    assert NodeState.ONLINE in reports
+
+
+@pytest.mark.asyncio
+async def test_resume_falls_back_when_stored_key_bad():
+    # Сохранённый ключ не подошёл — откат на заданный способ (пароль).
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    pw_calls = []
+
+    async def bootstrap_password(ip, login, password):
+        pw_calls.append(ip)
+        return BootstrapResult(ok=True, private_key="PRIVKEY")
+
+    async def bootstrap_key(ip, login, private_key):
+        return BootstrapResult(ok=False, detail="ключ не принят")
+
+    deps = _deps(
+        client=client, reports=reports,
+        bootstrap_password=bootstrap_password,
+        vault_get=lambda path: {"private_key": "STORED"},
+    )
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    assert pw_calls == ["1.2.3.4"]   # откатились на пароль
+    assert NodeState.ONLINE in reports
+
+
+@pytest.mark.asyncio
+async def test_no_stored_key_uses_payload_auth():
+    # Vault пуст для этого IP → обычная развилка по паролю, без resume.
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    key_calls = []
+
+    async def bootstrap_key(ip, login, private_key):
+        key_calls.append(private_key)
+        return BootstrapResult(ok=True, private_key=private_key)
+
+    def vault_get(path):
+        raise KeyError("нет такого пути")
+
+    deps = _deps(
+        client=client, reports=reports,
+        bootstrap_key=bootstrap_key, vault_get=vault_get,
+    )
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    assert key_calls == []           # resume не сработал
+    assert NodeState.ONLINE in reports
+
+
+@pytest.mark.asyncio
 async def test_bootstrap_failure_goes_failed():
     reports = []
     client = _FakeClient([NodeConnState.ONLINE])

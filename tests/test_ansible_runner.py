@@ -60,6 +60,29 @@ async def test_run_playbook_failure_status():
 
 
 @pytest.mark.asyncio
+async def test_run_playbook_failure_detail_includes_task_reason():
+    # На провале причина из событий ansible-runner должна попасть в detail.
+    events = [
+        {"event": "runner_on_ok", "event_data": {"task": "Install socat"}},
+        {
+            "event": "runner_on_failed",
+            "event_data": {
+                "task": "Issue certificate (HTTP-01 standalone)",
+                "res": {"msg": "non-zero return code"},
+            },
+        },
+    ]
+    result = types.SimpleNamespace(rc=2, status="failed", events=events)
+    res = await ar.run_playbook(
+        "/pb/issue_cert.yml", "1.2.3.4", "root", "PRIVKEY",
+        runner=lambda **k: result,
+    )
+    assert res.ok is False
+    assert "Issue certificate (HTTP-01 standalone)" in res.detail
+    assert "non-zero return code" in res.detail
+
+
+@pytest.mark.asyncio
 async def test_run_playbook_nonzero_rc_with_successful_status_is_failure():
     # Защита: ok только при rc==0 И status=="successful".
     res = await ar.run_playbook(

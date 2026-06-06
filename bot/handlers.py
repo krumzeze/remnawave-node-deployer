@@ -21,7 +21,7 @@ from aiogram.types import Message
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 
-from bot.states import AddNode
+from bot.states import AddNode, ChangePanel
 from config import settings
 from orchestrator import domain
 from orchestrator.ssh_bootstrap import _generate_keypair
@@ -322,6 +322,47 @@ async def _go_confirm_step(message: Message, state: FSMContext) -> None:
     await message.answer(_confirm_summary(data))
 
 
+async def _load_saved_panel(owner: int) -> tuple[str, str] | None:
+    """URL и токен сохранённой панели владельца, либо None.
+
+    URL берём из БД, токен — из Vault по token_vault_path. Любая ошибка чтения
+    (нет панели, Vault недоступен, пустой токен) → None: тогда бот спросит
+    данные панели как раньше, диалог не падает."""
+    from db import get_sessionmaker
+    from db.repo import get_saved_panel
+    from secretstore.vault import VaultStore
+
+    panel = await get_saved_panel(get_sessionmaker(), owner)
+    if panel is None:
+        return None
+    url, token_path = panel.url, panel.token_vault_path
+    try:
+        token = (VaultStore().get(token_path) or {}).get("token", "")
+    except Exception as exc:  # noqa: BLE001 — нет секрета/Vault недоступен
+        logger.warning("не удалось прочитать токен панели из Vault: %s", exc)
+        return None
+    if not token:
+        return None
+    return url, token
+
+
+async def _save_panel(owner: int, url: str, token: str) -> None:
+    """Сохранить панель владельца: токен в Vault, метаданные в БД.
+
+    Общий код для шага подтверждения /add и команды /panel. Путь токена в Vault
+    фиксированный на владельца (single-tenant, ADR 0003), get_or_create_panel
+    не плодит дубли по (owner, url)."""
+    from db import get_sessionmaker
+    from db.repo import get_or_create_panel
+    from secretstore.vault import VaultStore
+
+    token_path = f"panels/{owner}/token"
+    VaultStore().put(token_path, {"token": token})
+    await get_or_create_panel(
+        get_sessionmaker(), owner_tg_id=owner, url=url, token_vault_path=token_path
+    )
+
+
 async def _get_queue() -> ArqRedis:
     global _queue
     if _queue is None:
@@ -341,10 +382,55 @@ async def start(message: Message) -> None:
 
 @router.message(F.text == "/add")
 async def add_start(message: Message, state: FSMContext) -> None:
+    owner = message.from_user.id if message.from_user else 0
+
+    # Панель вводится один раз: если она уже сохранена — переиспользуем и сразу
+    # переходим к серверу, не спрашивая URL/токен снова (ADR 0003).
+    saved = await _load_saved_panel(owner)
+    if saved:
+        url, token = saved
+        await state.update_data(
+            panel_mode="existing", panel_url=url, panel_token=token
+        )
+        await state.set_state(AddNode.wait_ip)
+        await message.answer(
+            f"Панель: {url} (сохранена). Сменить — /panel.\n\nIP сервера:"
+        )
+        return
+
     await state.set_state(AddNode.choose_panel_mode)
     await message.answer(
         "Подключить существующую панель или развернуть с нуля?\n"
         "Ответь: existing | new"
+    )
+
+
+@router.message(F.text == "/panel")
+async def change_panel_start(message: Message, state: FSMContext) -> None:
+    await state.set_state(ChangePanel.wait_url)
+    await message.answer("URL панели (https://...):")
+
+
+@router.message(ChangePanel.wait_url)
+async def change_panel_url(message: Message, state: FSMContext) -> None:
+    url = (message.text or "").strip()
+    if not url.startswith(("http://", "https://")):
+        await message.answer("Нужен URL вида https://panel.example.")
+        return
+    await state.update_data(panel_url=url)
+    await state.set_state(ChangePanel.wait_token)
+    await message.answer("API-токен панели:")
+
+
+@router.message(ChangePanel.wait_token)
+async def change_panel_token(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    owner = message.from_user.id if message.from_user else 0
+    await _save_panel(owner, data["panel_url"], (message.text or "").strip())
+    await state.clear()
+    await message.answer(
+        f"Панель сохранена: {data['panel_url']}.\n"
+        "Теперь /add сразу спросит сервер, без ввода панели."
     )
 
 
@@ -547,16 +633,16 @@ async def confirm(message: Message, state: FSMContext) -> None:
 
     from db import get_sessionmaker
     from db.repo import create_node_record, get_or_create_panel
-    from secretstore.vault import VaultStore
 
     owner = message.from_user.id if message.from_user else 0
     ip = data["ip"]
 
-    # Токен панели — в Vault; в БД только путь к нему (секрет в БД не пишем).
-    token_path = f"panels/{owner}/token"
-    VaultStore().put(token_path, {"token": data.get("panel_token", "")})
+    # Сохранить/переиспользовать панель (токен в Vault, метаданные в БД). При
+    # реюзе сохранённой панели это идемпотентно: тот же путь и та же запись.
+    await _save_panel(owner, data["panel_url"], data.get("panel_token", ""))
 
     sm = get_sessionmaker()
+    token_path = f"panels/{owner}/token"
     panel_id = await get_or_create_panel(
         sm, owner_tg_id=owner, url=data["panel_url"], token_vault_path=token_path
     )
