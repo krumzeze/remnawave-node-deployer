@@ -13,7 +13,8 @@
   hosts: all
   become: true
   vars:
-    inbound_ports: []          # список портов, передаётся из оркестратора
+    inbound_ports: []          # tcp-порты inbound'ов, передаётся из оркестратора
+    inbound_udp_ports: []      # порты, которым нужен ещё и udp (Shadowsocks)
   tasks:
     - name: Require at least one inbound port
       ansible.builtin.assert:
@@ -21,11 +22,22 @@
           - inbound_ports | length > 0
         fail_msg: "inbound_ports пуст — нечего открывать"
 
-    # Все шесть пунктов меню (ADR 0005) — TCP-транспорты (Reality TCP/xHTTP/gRPC,
-    # TLS xHTTP/WS, Shadowsocks-2022 поверх tcp), поэтому открываем tcp.
+    # Транспорты inbound'ов поверх tcp (Reality TCP/xHTTP/gRPC, TLS xHTTP/WS,
+    # Shadowsocks-2022). Открываем tcp всем.
     - name: Allow selected inbound ports (tcp)
       community.general.ufw:
         rule: allow
         port: "{{ item | string }}"
         proto: tcp
       loop: "{{ inbound_ports }}"
+
+    # Shadowsocks-2022 принимает ещё и udp (в конфиге network: tcp,udp). Без
+    # этого правила udp-трафик клиентов резался бы firewall'ом. Список приходит
+    # из оркестратора — открываем udp только тем портам, кому он реально нужен.
+    - name: Allow udp for inbound ports that need it (Shadowsocks)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item | string }}"
+        proto: udp
+      loop: "{{ inbound_udp_ports }}"
+      when: inbound_udp_ports | length > 0

@@ -23,25 +23,31 @@
           - cert_domain | length > 0
         fail_msg: "cert_domain не задан — нечего выпускать"
 
-    # acme.sh --standalone поднимает собственный слушатель на :80 через socat.
-    - name: Install socat (needed by acme.sh standalone mode)
+    # socat нужен acme.sh --standalone (свой слушатель на :80), curl — самому
+    # установщику acme.sh ниже. На голой Ubuntu curl может отсутствовать, а без
+    # него установщик молча не отработает (см. pipefail в шаге установки).
+    - name: Install socat and curl (needed by acme.sh)
       ansible.builtin.apt:
-        name: socat
+        name:
+          - socat
+          - curl
         state: present
         update_cache: true
 
-    # HTTP-01 проходит по порту 80 — открываем его на время и для проверки CA.
-    - name: Allow HTTP (port 80) for ACME challenge
-      community.general.ufw:
-        rule: allow
-        port: "80"
-        proto: tcp
+    # Порт 80 для HTTP-01 не держим открытым постоянно: его открывает и
+    # закрывает сам acme.sh через pre/post-hook вокруг челленджа (см. --issue
+    # ниже). Те же хуки сохраняются в конфиге домена и отрабатывают при
+    # автопродлении по cron, так что 80 открыт только на считанные секунды.
 
+    # pipefail обязателен: иначе падение curl (нет сети, нет бинарника) маскируется
+    # нулевым кодом sh справа от пайпа, шаг «успешен», а acme.sh не установлен —
+    # и плейбук падает позже, на Select ACME CA, с непонятным No such file.
     - name: Install acme.sh
       ansible.builtin.shell: |
-        set -e
+        set -euo pipefail
         curl -fsSL https://get.acme.sh | sh -s email={{ cert_email | quote }}
       args:
+        executable: /bin/bash
         creates: "{{ acme_home }}/acme.sh"
 
     - name: Select ACME CA
@@ -63,6 +69,8 @@
           {{ acme_home }}/acme.sh --issue --standalone
           -d {{ cert_domain }}
           --server {{ acme_server }}
+          --pre-hook "ufw allow 80/tcp || true"
+          --post-hook "ufw delete allow 80/tcp || true"
         creates: "{{ acme_home }}/{{ cert_domain }}_ecc/{{ cert_domain }}.cer"
 
     # Ставим сертификат в монтируемый каталог. reloadcmd перезапускает контейнер

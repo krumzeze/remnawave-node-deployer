@@ -1,6 +1,10 @@
 services:
   remnanode:
     image: remnawave/node:latest
+    # Фиксируем имя контейнера: reloadcmd в issue_cert.yml перезапускает ноду по
+    # имени `remnanode` при автопродлении сертификата. Без этого compose назвал бы
+    # контейнер remnanode-remnanode-1 и docker restart не нашёл бы его.
+    container_name: remnanode
     restart: always
     network_mode: host
     environment:

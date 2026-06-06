@@ -267,6 +267,30 @@ class RemnawaveClient:
             for p in resp.config_profiles
         ]
 
+    async def _find_config_profile(self, name: str) -> CreatedProfile | None:
+        """Найти профиль по имени и собрать карту tag→inbound_uuid, либо None.
+
+        Нужно для идемпотентности create_config_profile: повторный провижн той же
+        ноды не должен плодить дубли профилей в панели. Защитно: если листинг не
+        получился или у inbound'ов нет тегов — возвращаем None и создаём заново.
+        """
+        try:
+            resp = await self._sdk.config_profiles.get_config_profiles()
+        except Exception:  # noqa: BLE001 — недоступность листинга не должна ломать создание
+            return None
+        for prof in getattr(resp, "config_profiles", None) or []:
+            if getattr(prof, "name", None) != name:
+                continue
+            mapping = {
+                inb.tag: str(inb.uuid)
+                for inb in (getattr(prof, "inbounds", None) or [])
+                if getattr(inb, "tag", None) is not None
+            }
+            if not mapping:
+                return None
+            return CreatedProfile(uuid=str(prof.uuid), tag_to_inbound=mapping)
+        return None
+
     async def create_config_profile(self, name: str, config: dict) -> CreatedProfile:
         """Создать config-profile из готового Xray-конфига (вариант «авто»).
 
@@ -274,7 +298,14 @@ class RemnawaveClient:
         Панель сама разбирает inbounds и присваивает им uuid'ы и теги; возвращаем
         uuid профиля и карту tag→inbound_uuid, по которой вызывающий код выбирает
         нужные инбаунды для create_node.
+
+        Идемпотентно: если профиль с таким именем уже есть (повторный запуск той
+        же ноды), переиспользуем его, а не создаём дубль.
         """
+        existing = await self._find_config_profile(name)
+        if existing is not None:
+            log.info("config-profile %s уже есть — переиспользую", name)
+            return existing
         body = _build_config_profile_request(name, config)
         resp = await self._sdk.config_profiles.create_config_profile(body=body)
         return CreatedProfile(
@@ -298,12 +329,40 @@ class RemnawaveClient:
         привязывает ноду к профилю и набору инбаундов сразу при создании.
         Секрет/порт контейнера тут не возвращаются — авторизация по pubKey
         панели (см. модуль docstring и get_panel_pubkey).
+
+        Идемпотентно: если нода с таким адресом уже зарегистрирована (повторный
+        запуск), переиспользуем её, а не заводим дубль.
         """
+        existing = await self._find_node_by_address(address)
+        if existing is not None:
+            log.info("нода с адресом %s уже есть — переиспользую", address)
+            return existing
         body = _build_create_request(
             name, address, port, config_profile_uuid, active_inbounds, country_code
         )
         node = await self._sdk.nodes.create_node(body=body)
         return _to_info(node)
+
+    async def _find_node_by_address(self, address: str) -> NodeInfo | None:
+        """Найти зарегистрированную ноду по адресу, либо None.
+
+        Нужно для идемпотентности create_node. Защитно: если у SDK нет метода
+        листинга или он упал/отдал неожиданную форму — возвращаем None и идём
+        обычным путём создания (хуже дубль, чем падение всего провижина)."""
+        getter = getattr(self._sdk.nodes, "get_all_nodes", None)
+        if getter is None:
+            return None
+        try:
+            resp = await getter()
+        except Exception:  # noqa: BLE001 — недоступность листинга не ломает создание
+            return None
+        nodes = getattr(resp, "nodes", None)
+        if nodes is None:
+            nodes = resp if isinstance(resp, list) else []
+        for node in nodes:
+            if getattr(node, "address", None) == address:
+                return _to_info(node)
+        return None
 
     async def get_node_status(self, uuid: str) -> NodeConnState:
         """Состояние ноды по uuid; поллим до NodeConnState.ONLINE."""

@@ -96,6 +96,9 @@ class ProvisionDeps:
     make_client: Callable[[str, str], RemnawaveClient] = _default_make_client
     vault_put: Callable[[str, dict], Any] | None = None
     vault_get: Callable[[str], dict] | None = None
+    # Запись uuid ноды/пути ключа в строку Node. Привязан к node_id, поэтому
+    # достраивается в build_production_deps; по умолчанию None — шаг пропускается.
+    persist_node: Callable[..., Awaitable[None]] | None = None
     report: Callable[[NodeState, str], Awaitable[None]] = _noop_report
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_attempts: int = POLL_ATTEMPTS
@@ -200,6 +203,24 @@ class _Pipeline:
             return
         self.deps.vault_put(f"nodes/{ip}/ssh", {"private_key": private_key})
 
+    async def _persist_node(
+        self, *, remnawave_uuid: str | None = None,
+        ssh_key_vault_path: str | None = None,
+    ) -> None:
+        """Записать в БД uuid ноды / путь ключа, если шов задан (best-effort).
+
+        Сбой записи не должен валить провижн — он уже сделал необратимое; логируем
+        и идём дальше, ровно как report."""
+        if self.deps.persist_node is None:
+            return
+        try:
+            await self.deps.persist_node(
+                remnawave_uuid=remnawave_uuid,
+                ssh_key_vault_path=ssh_key_vault_path,
+            )
+        except Exception:  # noqa: BLE001 — запись метаданных не критична для провижина
+            logger.exception("persist_node: не удалось записать поля ноды")
+
     async def _setup_tls(
         self, ip: str, login: str, private_key: str, choices: list[InboundChoice]
     ) -> tuple[str | None, str | None, str | None]:
@@ -256,13 +277,22 @@ class _Pipeline:
         if not ports:
             raise ProvisionError("генератор не вернул портов inbound'ов")
 
+        # Shadowsocks слушает ещё и udp (network: tcp,udp в конфиге) — открываем
+        # udp только его порту, остальным inbound'ам udp не нужен. Тег == значению
+        # InboundChoice по построению генератора, поэтому опознаём SS по тегу.
+        udp_ports = sorted(
+            port
+            for tag, port in generated.ports.items()
+            if tag == InboundChoice.SHADOWSOCKS.value
+        )
+
         await self.deps.report(self.state, f"Открываю порты в UFW: {ports}")
         result = await self.deps.run_playbook(
             ansible_runner.OPEN_PORTS_PLAYBOOK,
             ip,
             login,
             private_key,
-            extra_vars={"inbound_ports": ports},
+            extra_vars={"inbound_ports": ports, "inbound_udp_ports": udp_ports},
         )
         if not result.ok:
             raise ProvisionError(result.detail)
@@ -285,6 +315,7 @@ class _Pipeline:
         # 1. Bootstrap: сервер переходит на ключевую аутентификацию.
         private_key = await self._bootstrap()
         self._store_key(ip, private_key)
+        await self._persist_node(ssh_key_vault_path=f"nodes/{ip}/ssh")
 
         # 2. Provisioning: hardening + разворот контейнера ноды.
         await self._advance(NodeState.PROVISIONING, "Настраиваю сервер")
@@ -369,6 +400,7 @@ class _Pipeline:
             port=NODE_APP_PORT,
             country_code=self.p.get("country_code", "XX"),
         )
+        await self._persist_node(remnawave_uuid=node.uuid)
 
         # 3b. Публикация пользователям (ADR 0008): на каждый инбаунд заводим host
         # (строку подключения в подписке) и добавляем инбаунды в выбранные сквады.
@@ -485,7 +517,7 @@ def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
     node_id/chat_id — из payload, поставленного ботом.
     """
     from db import get_sessionmaker
-    from db.repo import record_status
+    from db.repo import record_status, set_node_fields
     from secretstore.vault import VaultStore
 
     node_id = payload.get("node_id")
@@ -502,6 +534,16 @@ def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
     async def persist(nid: int, state: str, detail: str) -> None:
         await record_status(session_factory, nid, state, detail)
 
+    async def persist_node(
+        *, remnawave_uuid: str | None = None,
+        ssh_key_vault_path: str | None = None,
+    ) -> None:
+        await set_node_fields(
+            session_factory, node_id,
+            remnawave_uuid=remnawave_uuid,
+            ssh_key_vault_path=ssh_key_vault_path,
+        )
+
     notify = None
     if bot is not None:
         async def notify(cid: int, text: str) -> None:  # noqa: F811
@@ -510,7 +552,10 @@ def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
     report = reporting.make_reporter(
         node_id, chat_id, persist=persist, notify=notify
     )
-    return ProvisionDeps(report=report, vault_put=vault.put, vault_get=vault.get)
+    return ProvisionDeps(
+        report=report, vault_put=vault.put, vault_get=vault.get,
+        persist_node=persist_node,
+    )
 
 
 async def provision_node(ctx: dict, payload: dict) -> None:

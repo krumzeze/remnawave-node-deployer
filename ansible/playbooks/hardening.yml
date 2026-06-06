@@ -1,6 +1,9 @@
 ---
 # Хардденинг сервера. Запускается ПОСЛЕ того, как вход по ключу проверен.
-# Отключение парольного входа — последний шаг (принцип «не навреди», ADR 0002).
+# Парольный вход здесь НЕ трогаем: для ветки «password» его уже отключил
+# bootstrap (с учётом cloud-init drop-in и проверкой sshd -t), а для ветки
+# «key» доступ оператора его собственными средствами мы не трогаем намеренно
+# (ADR 0002, принцип «не навреди»).
 - name: Harden server
   hosts: all
   become: true
@@ -26,17 +29,3 @@
       ansible.builtin.apt:
         name: fail2ban
         state: present
-
-    # TODO: вынести проверку входа по ключу до этой задачи
-    - name: Disable SSH password authentication
-      ansible.builtin.lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?PasswordAuthentication'
-        line: 'PasswordAuthentication no'
-      notify: Restart sshd
-
-  handlers:
-    - name: Restart sshd
-      ansible.builtin.service:
-        name: ssh
-        state: restarted

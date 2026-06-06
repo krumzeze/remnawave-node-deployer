@@ -94,6 +94,33 @@ async def create_node_record(
         return node.id
 
 
+async def set_node_fields(
+    session_factory: async_sessionmaker,
+    node_id: int,
+    *,
+    remnawave_uuid: str | None = None,
+    ssh_key_vault_path: str | None = None,
+) -> None:
+    """Проставить ноде её uuid в панели и/или путь SSH-ключа в Vault.
+
+    Вызывается воркером после bootstrap (путь ключа) и после регистрации в
+    панели (uuid). Передаём только то, что есть; None-поля не трогаем, чтобы
+    повторный вызов не затирал ранее записанное. Нет ноды — просто лог.
+    """
+    if remnawave_uuid is None and ssh_key_vault_path is None:
+        return
+    async with session_factory() as session:
+        node = await session.get(Node, node_id)
+        if node is None:
+            log.warning("set_node_fields: нет ноды id=%s", node_id)
+            return
+        if remnawave_uuid is not None:
+            node.remnawave_uuid = remnawave_uuid
+        if ssh_key_vault_path is not None:
+            node.ssh_key_vault_path = ssh_key_vault_path
+        await session.commit()
+
+
 async def record_status(
     session_factory: async_sessionmaker,
     node_id: int,

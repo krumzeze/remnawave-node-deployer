@@ -9,10 +9,31 @@
     remnanode_port: 0
     cert_dir_host: /opt/remnanode/certs
   tasks:
+    # curl нужен установщику Docker ниже; на голой Ubuntu его может не быть.
+    - name: Install curl (needed by Docker convenience script)
+      ansible.builtin.apt:
+        name: curl
+        state: present
+        update_cache: true
+
+    # pipefail обязателен: без него падение curl маскируется нулевым кодом sh
+    # справа от пайпа, шаг «успешен», а docker не установлен.
     - name: Install Docker via official convenience script
-      ansible.builtin.shell: curl -fsSL https://get.docker.com | sh
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl -fsSL https://get.docker.com | sh
       args:
+        executable: /bin/bash
         creates: /usr/bin/docker
+
+    # Порт, на котором контейнер ноды слушает панель (APP_PORT). hardening
+    # оставил default deny + только 22, поэтому без этого правила управляющее
+    # соединение панель→нода упрётся в firewall и нода не выйдет online.
+    - name: Allow node app port in UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ remnanode_port | string }}"
+        proto: tcp
 
     - name: Create remnanode dir
       ansible.builtin.file:
