@@ -32,11 +32,12 @@
     # socat нужен acme.sh --standalone (свой слушатель на :80), curl — самому
     # установщику acme.sh ниже. На голой Ubuntu curl может отсутствовать, а без
     # него установщик молча не отработает (см. pipefail в шаге установки).
-    - name: Install socat and curl (needed by acme.sh)
+    - name: Install socat, curl and git (needed by acme.sh)
       ansible.builtin.apt:
         name:
           - socat
           - curl
+          - git
         state: present
         update_cache: true
 
@@ -45,16 +46,44 @@
     # ниже). Те же хуки сохраняются в конфиге домена и отрабатывают при
     # автопродлении по cron, так что 80 открыт только на считанные секунды.
 
-    # pipefail обязателен: иначе падение curl (нет сети, нет бинарника) маскируется
-    # нулевым кодом sh справа от пайпа, шаг «успешен», а acme.sh не установлен —
-    # и плейбук падает позже, на Select ACME CA, с непонятным No such file.
-    - name: Install acme.sh
+    - name: Check whether acme.sh is already installed
+      ansible.builtin.stat:
+        path: "{{ acme_home }}/acme.sh"
+      register: acme_bin
+
+    # Ставим не через `curl | sh`, а из клона репозитория локальным установщиком.
+    # В режиме пайпа установщик не может скопировать себя из файла, тянет исходники
+    # сам и в ряде окружений выходит с кодом 0, ничего не положив в --home, — тогда
+    # шаг «успешен», а Select ACME CA падает с невнятным No such file. Локальный
+    # `./acme.sh --install --home` детерминированно кладёт бинарник в {{ acme_home }}.
+    - name: Install acme.sh from source
       ansible.builtin.shell: |
         set -euo pipefail
-        curl -fsSL https://get.acme.sh | sh -s email={{ cert_email | quote }}
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        git clone --depth 1 https://github.com/acmesh-official/acme.sh.git "$tmp/acme.sh"
+        cd "$tmp/acme.sh"
+        ./acme.sh --install --home {{ acme_home }} --accountemail {{ cert_email | quote }}
       args:
         executable: /bin/bash
-        creates: "{{ acme_home }}/acme.sh"
+      register: acme_install
+      when: not acme_bin.stat.exists
+
+    # Не доверяем коду возврата установщика: проверяем сам факт наличия бинарника,
+    # иначе ошибка всплывёт ниже как непонятный No such file. Если файла нет —
+    # падаем здесь и показываем вывод установщика, чтобы причина была видна сразу.
+    - name: Verify acme.sh binary exists
+      ansible.builtin.stat:
+        path: "{{ acme_home }}/acme.sh"
+      register: acme_bin_final
+
+    - name: Fail clearly if acme.sh did not install
+      ansible.builtin.fail:
+        msg: >-
+          acme.sh не установился в {{ acme_home }}/acme.sh.
+          stdout: {{ acme_install.stdout | default('') }} |
+          stderr: {{ acme_install.stderr | default('') }}
+      when: not acme_bin_final.stat.exists
 
     - name: Select ACME CA
       ansible.builtin.command:
