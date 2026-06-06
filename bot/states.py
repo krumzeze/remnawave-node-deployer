@@ -29,4 +29,8 @@ class AddNode(StatesGroup):
     wait_reality_dest = State()  # донор Reality per-node (ADR 0007); есть дефолт
     wait_country = State()       # код страны ноды (ISO-2) для create_node
 
+    # Куда подключить ноду, чтобы её увидели пользователи (ADR 0008): список
+    # внутренних сквадов тянем из панели, оператор выбирает (дефолт — все).
+    choose_squads = State()
+
     confirm = State()

@@ -10,13 +10,15 @@ import pytest
 
 from orchestrator import ansible_runner, tasks
 from orchestrator.remnawave_client import (
+    CreatedHost,
     CreatedProfile,
+    InternalSquadRef,
     NodeConnState,
     NodeInfo,
 )
 from orchestrator.ssh_bootstrap import BootstrapResult
 from orchestrator.statemachine import NodeState
-from orchestrator.xray_config import GeneratedProfile, InboundChoice
+from orchestrator.xray_config import GeneratedProfile, HostHint, InboundChoice
 
 
 class _FakeClient:
@@ -56,14 +58,44 @@ class _FakeClient:
             return self._statuses.pop(0)
         return self._statuses[0]
 
+    async def create_host(self, **kwargs):
+        # Накапливаем заведённые хосты для проверок (ADR 0008).
+        if not hasattr(self, "hosts_created"):
+            self.hosts_created = []
+        self.hosts_created.append(kwargs)
+        return CreatedHost(
+            uuid=f"host-{len(self.hosts_created)}",
+            remark=kwargs["remark"], address=kwargs["address"], port=kwargs["port"],
+        )
+
+    async def list_internal_squads(self):
+        # Две группы доступа; одна уже содержит инбаунд, чтобы проверять дедуп.
+        return [
+            InternalSquadRef(uuid="sq-1", name="all", inbound_uuids=[]),
+            InternalSquadRef(uuid="sq-2", name="vip", inbound_uuids=[]),
+        ]
+
+    async def add_inbounds_to_squads(self, squad_uuids, inbound_uuids):
+        self.squads_called = (list(squad_uuids), list(inbound_uuids))
+
 
 def _generated(tags):
     # Раскладка портов как у реального генератора: первый — 443, дальше фолбэки.
     pool = [443, 8443, 2053, 2083, 2087, 2096]
     tags = list(tags)
     ports = {t: pool[i] for i, t in enumerate(tags)}
+    # Подсказки хостов: reality для большинства, none для shadowsocks.
+    hosts = {
+        t: HostHint(
+            security="none" if t == "shadowsocks" else "reality",
+            network="tcp",
+            sni=None if t == "shadowsocks" else "www.microsoft.com",
+        )
+        for t in tags
+    }
     return GeneratedProfile(
-        config={"inbounds": [{"tag": t} for t in tags]}, tags=tags, ports=ports
+        config={"inbounds": [{"tag": t} for t in tags]}, tags=tags, ports=ports,
+        hosts=hosts,
     )
 
 
@@ -146,6 +178,71 @@ async def test_happy_path_reaches_online():
     # create_node получил наш порт и профиль.
     assert client.create_node_kwargs["port"] == tasks.NODE_APP_PORT
     assert client.create_node_kwargs["config_profile_uuid"] == "prof-1"
+
+
+@pytest.mark.asyncio
+async def test_publish_creates_hosts_and_links_squads():
+    # Дефолтный набor — четыре inbound'а; на каждый ожидаем по host'у.
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    deps = _deps(client=client, reports=reports)
+
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    # На каждый инбаунд из tag_to_inbound заведён host со своим адресом/портом.
+    created = client.hosts_created
+    assert [h["inbound_uuid"] for h in created] == ["inb-a", "inb-b", "inb-c", "inb-d"]
+    assert created[0]["address"] == "1.2.3.4"          # domain-free → IP ноды
+    assert created[0]["port"] == 443
+    assert created[0]["security"] == "reality"
+    assert created[0]["node_uuid"] == "node-uuid"
+    # Сквады не заданы в payload → дефолт «все»: добавили во все сквады панели.
+    squads, inbounds = client.squads_called
+    assert squads == ["sq-1", "sq-2"]
+    assert inbounds == ["inb-a", "inb-b", "inb-c", "inb-d"]
+
+
+@pytest.mark.asyncio
+async def test_publish_uses_selected_squads_from_payload():
+    client = _FakeClient([NodeConnState.ONLINE])
+    deps = _deps(client=client, reports=[])
+
+    await tasks.provision_node(
+        {"deps": deps}, _payload(squad_uuids=["sq-2"])
+    )
+
+    squads, _ = client.squads_called
+    assert squads == ["sq-2"]
+
+
+@pytest.mark.asyncio
+async def test_publish_tls_host_uses_domain(monkeypatch):
+    # Для TLS-инбаунда адрес host'а — домен ноды, а не IP.
+    from orchestrator import domain
+
+    client = _TlsClient([NodeConnState.ONLINE])
+
+    async def check_domain(name, ip):
+        return domain.DomainCheck(ok=True, detail="")
+
+    deps = _deps(
+        client=client, reports=[], check_domain=check_domain,
+        build_profile=lambda choices, **kw: GeneratedProfile(
+            config={"inbounds": []}, tags=["vless-xhttp-tls"],
+            ports={"vless-xhttp-tls": 443},
+            hosts={"vless-xhttp-tls": HostHint(
+                security="tls", network="xhttp", sni="vpn.example.com", path="/")},
+        ),
+    )
+
+    await tasks.provision_node(
+        {"deps": deps},
+        _payload(inbounds=["vless-xhttp-tls"], tls_domain="vpn.example.com"),
+    )
+
+    host = client.hosts_created[0]
+    assert host["address"] == "vpn.example.com"
+    assert host["security"] == "tls"
 
 
 @pytest.mark.asyncio

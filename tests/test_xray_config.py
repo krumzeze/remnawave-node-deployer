@@ -188,3 +188,43 @@ def test_ports_map_respects_overrides():
     )
     assert prof.ports["shadowsocks"] == 9999
     assert prof.ports["vless-reality-tcp"] == 443
+
+
+def test_host_hints_reality_use_donor_sni_and_firefox():
+    prof = build_profile(
+        [InboundChoice.VLESS_XHTTP_REALITY],
+        reality_dest="www.cloudflare.com:443",
+        reality_server_names=("www.cloudflare.com",),
+    )
+    h = prof.hosts["vless-xhttp-reality"]
+    assert h.security == "reality"
+    assert h.network == "xhttp"
+    assert h.sni == "www.cloudflare.com"   # донор, а не домен ноды
+    assert h.path == "/"
+    assert h.fingerprint == "firefox"
+
+
+def test_host_hints_grpc_service_name_as_path():
+    prof = build_profile([InboundChoice.VLESS_GRPC_REALITY])
+    assert prof.hosts["vless-grpc-reality"].path == "grpc"
+    assert prof.hosts["vless-grpc-reality"].network == "grpc"
+
+
+def test_host_hints_tls_use_node_domain():
+    prof = build_profile(
+        [InboundChoice.VLESS_XHTTP_TLS],
+        tls_domain="vpn.example.com",
+        cert_file="/c.pem", key_file="/k.pem",
+    )
+    h = prof.hosts["vless-xhttp-tls"]
+    assert h.security == "tls"
+    assert h.sni == "vpn.example.com"
+    assert h.fingerprint == "firefox"
+
+
+def test_host_hints_shadowsocks_no_security():
+    prof = build_profile([InboundChoice.SHADOWSOCKS])
+    h = prof.hosts["shadowsocks"]
+    assert h.security == "none"
+    assert h.sni is None
+    assert h.fingerprint is None

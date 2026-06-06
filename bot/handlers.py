@@ -186,6 +186,9 @@ def build_payload(data: dict, *, node_id: int, chat_id: int) -> dict:
         payload["reality_server_names"] = data.get("reality_server_names", [])
     if data.get("country_code"):
         payload["country_code"] = data["country_code"]
+    # Сквады для привязки (ADR 0008). Не заданы → не кладём, воркер добавит во все.
+    if data.get("squad_uuids"):
+        payload["squad_uuids"] = data["squad_uuids"]
     return payload
 
 
@@ -221,6 +224,13 @@ def _confirm_summary(data: dict) -> str:
     lines.append(f"Страна: {cc if cc else 'XX (не указана)'}.")
     if data.get("tls_domain"):
         lines.append(f"Домен: {data['tls_domain']}.")
+    squad_uuids = data.get("squad_uuids")
+    options = data.get("squad_options", [])
+    if squad_uuids:
+        names = [o["name"] for o in options if o["uuid"] in squad_uuids]
+        lines.append(f"Сквады: {', '.join(names) if names else 'выбранные'}.")
+    else:
+        lines.append("Сквады: все (по умолчанию).")
     lines.append("\nЗапустить? Напиши: ok")
     return "\n".join(lines)
 
@@ -238,6 +248,78 @@ async def _go_donor_step(message: Message, state: FSMContext, data: dict) -> Non
 async def _go_country_step(message: Message, state: FSMContext) -> None:
     await state.set_state(AddNode.wait_country)
     await message.answer(_country_prompt())
+
+
+def _make_client(url: str, token: str):
+    """Сборка клиента панели для шага сквадов. Вынесено отдельной функцией, чтобы
+    тесты подменяли границу SDK (импорт ленивый — без пакета remnawave модуль
+    бота всё равно импортируется)."""
+    from orchestrator.remnawave_client import RemnawaveClient
+
+    return RemnawaveClient(url, token)
+
+
+def parse_squad_selection(text: str, options: list[dict]) -> list[str] | None:
+    """Разобрать выбор сквадов из сообщения оператора.
+
+    options — список {uuid, name} в порядке показа. Пусто / «all» → None («во все»,
+    в payload не кладём — воркер сам подставит все сквады). Иначе номера из списка
+    → список uuid'ов без дублей. Неизвестный номер → ValueError."""
+    raw = (text or "").strip().lower()
+    if raw in ("", "all", "все"):
+        return None
+    chosen: list[str] = []
+    for token in re.split(r"[\s,]+", raw):
+        if not token:
+            continue
+        if not token.isdigit() or not (1 <= int(token) <= len(options)):
+            raise ValueError(token)
+        uuid = options[int(token) - 1]["uuid"]
+        if uuid not in chosen:
+            chosen.append(uuid)
+    return chosen or None
+
+
+def _squads_menu_text(options: list[dict]) -> str:
+    lines = [f"{i} — {o['name']}" for i, o in enumerate(options, 1)]
+    return (
+        "В какие внутренние сквады добавить ноду, чтобы её увидели пользователи?\n"
+        "Перечисли номера через пробел/запятую, либо напиши all (по умолчанию — "
+        "во все):\n\n" + "\n".join(lines)
+    )
+
+
+async def _go_squads_step(message: Message, state: FSMContext, data: dict) -> None:
+    """Перед подтверждением показать сквады панели на выбор (ADR 0008).
+
+    Список тянем из панели по введённым ранее URL/токену. Если панель недоступна
+    или сквадов нет — не блокируем диалог: молча переходим к подтверждению,
+    воркер по умолчанию добавит ноду во все сквады."""
+    url = data.get("panel_url")
+    token = data.get("panel_token")
+    squads = []
+    if url and token:
+        try:
+            client = _make_client(url, token)
+            squads = await client.list_internal_squads()
+        except Exception as exc:  # noqa: BLE001 — диалог не должен падать из-за сети
+            logger.warning("не удалось получить сквады панели: %s", exc)
+            squads = []
+
+    if not squads:
+        await _go_confirm_step(message, state)
+        return
+
+    options = [{"uuid": s.uuid, "name": s.name} for s in squads]
+    await state.update_data(squad_options=options)
+    await state.set_state(AddNode.choose_squads)
+    await message.answer(_squads_menu_text(options))
+
+
+async def _go_confirm_step(message: Message, state: FSMContext) -> None:
+    await state.set_state(AddNode.confirm)
+    data = await state.get_data()
+    await message.answer(_confirm_summary(data))
 
 
 async def _get_queue() -> ArqRedis:
@@ -439,9 +521,24 @@ async def wait_country(message: Message, state: FSMContext) -> None:
         return
     if code is not None:
         await state.update_data(country_code=code)
-    await state.set_state(AddNode.confirm)
+    await _go_squads_step(message, state, await state.get_data())
+
+
+@router.message(AddNode.choose_squads)
+async def choose_squads(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await message.answer(_confirm_summary(data))
+    options = data.get("squad_options", [])
+    try:
+        squad_uuids = parse_squad_selection(message.text or "", options)
+    except ValueError as exc:
+        await message.answer(
+            f"Не знаю сквад «{exc}». Введи номера из списка или all."
+        )
+        return
+    # None («все») в payload не кладём — воркер сам добавит во все сквады.
+    if squad_uuids is not None:
+        await state.update_data(squad_uuids=squad_uuids)
+    await _go_confirm_step(message, state)
 
 
 @router.message(AddNode.confirm, F.text.lower() == "ok")

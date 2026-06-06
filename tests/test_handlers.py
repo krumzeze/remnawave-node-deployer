@@ -201,3 +201,55 @@ def test_build_payload_omits_reality_donor_and_country_when_absent():
     assert "reality_dest" not in payload
     assert "reality_server_names" not in payload
     assert "country_code" not in payload
+
+
+_SQUAD_OPTIONS = [
+    {"uuid": "sq-1", "name": "all"},
+    {"uuid": "sq-2", "name": "vip"},
+    {"uuid": "sq-3", "name": "trial"},
+]
+
+
+@pytest.mark.parametrize("text", ["", "all", "все", "  ALL  "])
+def test_parse_squad_selection_all_means_none(text):
+    # «Все» отдаём как None — в payload не кладём, воркер добавит во все сквады.
+    assert handlers.parse_squad_selection(text, _SQUAD_OPTIONS) is None
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("1", ["sq-1"]),
+        ("1 3", ["sq-1", "sq-3"]),
+        ("2,1", ["sq-2", "sq-1"]),
+        ("2 2 2", ["sq-2"]),            # дубли схлопываются
+    ],
+)
+def test_parse_squad_selection_numbers(text, expected):
+    assert handlers.parse_squad_selection(text, _SQUAD_OPTIONS) == expected
+
+
+@pytest.mark.parametrize("text", ["0", "4", "x", "1 bogus"])
+def test_parse_squad_selection_invalid_raises(text):
+    with pytest.raises(ValueError):
+        handlers.parse_squad_selection(text, _SQUAD_OPTIONS)
+
+
+def test_build_payload_carries_squad_uuids():
+    data = {
+        "panel_mode": "existing", "panel_url": "https://p",
+        "ip": "1.2.3.4", "login": "root", "auth": "key", "private_key": "K",
+        "inbounds": None, "squad_uuids": ["sq-2"],
+    }
+    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    assert payload["squad_uuids"] == ["sq-2"]
+
+
+def test_build_payload_omits_squads_when_absent():
+    data = {
+        "panel_mode": "existing", "panel_url": "https://p",
+        "ip": "1.2.3.4", "login": "root", "auth": "key", "private_key": "K",
+        "inbounds": None,
+    }
+    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    assert "squad_uuids" not in payload

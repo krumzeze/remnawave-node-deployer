@@ -332,10 +332,69 @@ class _Pipeline:
             country_code=self.p.get("country_code", "XX"),
         )
 
+        # 3b. Публикация пользователям (ADR 0008): на каждый инбаунд заводим host
+        # (строку подключения в подписке) и добавляем инбаунды в выбранные сквады.
+        # Без этого нода дойдёт до online, но у пользователей не появится.
+        await self._publish_to_users(
+            client, ip, node.uuid, profile, active_inbounds, generated, tls_domain
+        )
+
         # 4. Поллинг до online.
         status = await self._poll_until_online(client, node.uuid)
         await self._advance(NodeState.ONLINE, "Нода online")
         return status
+
+    async def _publish_to_users(
+        self,
+        client: RemnawaveClient,
+        ip: str,
+        node_uuid: str,
+        profile,
+        active_inbounds: list[str],
+        generated: xray_config.GeneratedProfile,
+        tls_domain: str | None,
+    ) -> None:
+        """Завести host'ы и привязать инбаунды к сквадам (ADR 0008).
+
+        На каждый выбранный инбаунд — один host. Адрес: для TLS-инбаунда домен
+        ноды (под него выпущен сертификат), для остального — IP. Параметры
+        (security/sni/path/fingerprint) берём из подсказок генератора, оператор
+        их не вводит.
+
+        Сквады: берём из payload (оператор выбрал в боте); если не заданы —
+        дефолт «все сквады панели» (ADR 0008). Инбаунды дописываются к текущему
+        составу сквада, существующие узлы не затрагиваются.
+        """
+        node_name = f"node-{ip}"
+        await self.deps.report(self.state, "Завожу хосты для подписки")
+        for tag in generated.tags:
+            inbound_uuid = profile.tag_to_inbound.get(tag)
+            if inbound_uuid is None:
+                continue
+            hint = generated.hosts.get(tag)
+            security = hint.security if hint else "default"
+            address = tls_domain if (security == "tls" and tls_domain) else ip
+            await client.create_host(
+                inbound_uuid=inbound_uuid,
+                config_profile_uuid=profile.uuid,
+                remark=f"{node_name}/{tag}"[:40],
+                address=address,
+                port=generated.ports[tag],
+                node_uuid=node_uuid,
+                security=security,
+                sni=hint.sni if hint else None,
+                path=hint.path if hint else None,
+                fingerprint=hint.fingerprint if hint else None,
+            )
+
+        squad_uuids = self.p.get("squad_uuids")
+        if squad_uuids is None:
+            squad_uuids = [s.uuid for s in await client.list_internal_squads()]
+        if squad_uuids:
+            await self.deps.report(
+                self.state, "Добавляю ноду в выбранные сквады"
+            )
+            await client.add_inbounds_to_squads(squad_uuids, active_inbounds)
 
     async def _poll_until_online(
         self, client: RemnawaveClient, node_uuid: str

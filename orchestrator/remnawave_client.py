@@ -64,6 +64,30 @@ class CreatedProfile:
     tag_to_inbound: dict[str, str]
 
 
+@dataclass
+class InternalSquadRef:
+    """Внутренний сквад панели и uuid'ы его инбаундов.
+
+    Сквад — это группа доступа: пользователь видит инбаунд (а значит и ноду с
+    хостом на этот инбаунд), только если инбаунд входит в его сквад. inbound_uuids
+    нужны для read-modify-write при добавлении новых инбаундов (см. ADR 0008).
+    """
+
+    uuid: str
+    name: str
+    inbound_uuids: list[str]
+
+
+@dataclass
+class CreatedHost:
+    """Только что созданный хост — точка входа, которую видит пользователь."""
+
+    uuid: str
+    remark: str
+    address: str
+    port: int
+
+
 def _derive_status(node) -> NodeConnState:
     """Свести флаги ответа панели к одному состоянию.
 
@@ -121,6 +145,78 @@ def _build_config_profile_request(name: str, config: dict):
     from remnawave.models import CreateConfigProfileRequestDto
 
     return CreateConfigProfileRequestDto(name=name, config=config)
+
+
+def _build_create_host_request(
+    *,
+    inbound_uuid: str,
+    config_profile_uuid: str,
+    remark: str,
+    address: str,
+    port: int,
+    node_uuid: str | None,
+    security: str,
+    sni: str | None,
+    host: str | None,
+    path: str | None,
+    fingerprint: str | None,
+    alpn: str | None,
+):
+    """Собрать CreateHostRequestDto. Импорт ленивый — как и у остальных билдеров.
+
+    security — доменная строка («reality»/«tls»/«none»/«default»); мапим её на
+    SecurityLayer панели, чтобы выше по стеку не тянуть энумы SDK. Хост ссылается
+    на инбаунд профиля (config_profile_uuid + inbound_uuid); nodes — это лишь
+    визуальная привязка к ноде в UI панели, на доступ она не влияет.
+    """
+    from uuid import UUID
+
+    from remnawave.enums import ALPN, Fingerprint, SecurityLayer
+    from remnawave.models import CreateHostInboundData, CreateHostRequestDto
+
+    sec_map = {
+        "reality": SecurityLayer.REALITY,
+        "tls": SecurityLayer.TLS,
+        "none": SecurityLayer.NONE,
+        "default": SecurityLayer.DEFAULT,
+    }
+    kwargs: dict = {
+        "inbound": CreateHostInboundData(
+            config_profile_uuid=UUID(str(config_profile_uuid)),
+            config_profile_inbound_uuid=UUID(str(inbound_uuid)),
+        ),
+        "remark": remark,
+        "address": address,
+        "port": port,
+        "security_layer": sec_map.get(security, SecurityLayer.DEFAULT),
+    }
+    if sni:
+        kwargs["sni"] = sni
+    if host:
+        kwargs["host"] = host
+    if path:
+        kwargs["path"] = path
+    if fingerprint:
+        kwargs["fingerprint"] = Fingerprint(fingerprint)
+    if alpn:
+        kwargs["alpn"] = ALPN(alpn)
+    if node_uuid:
+        kwargs["nodes"] = [UUID(str(node_uuid))]
+    return CreateHostRequestDto(**kwargs)
+
+
+def _build_update_squad_request(uuid: str, inbound_uuids: list[str]):
+    """Собрать UpdateInternalSquadRequestDto. name не передаём — он остаётся как
+    был; передаём только полный (объединённый) список инбаундов, т.к. update на
+    стороне панели заменяет его целиком."""
+    from uuid import UUID
+
+    from remnawave.models import UpdateInternalSquadRequestDto
+
+    return UpdateInternalSquadRequestDto(
+        uuid=UUID(str(uuid)),
+        inbounds=[UUID(str(i)) for i in inbound_uuids],
+    )
 
 
 class RemnawaveClient:
@@ -213,3 +309,80 @@ class RemnawaveClient:
         """Состояние ноды по uuid; поллим до NodeConnState.ONLINE."""
         node = await self._sdk.nodes.get_one_node(uuid=str(uuid))
         return _derive_status(node)
+
+    async def create_host(
+        self,
+        *,
+        inbound_uuid: str,
+        config_profile_uuid: str,
+        remark: str,
+        address: str,
+        port: int,
+        node_uuid: str | None = None,
+        security: str = "default",
+        sni: str | None = None,
+        host: str | None = None,
+        path: str | None = None,
+        fingerprint: str | None = None,
+        alpn: str | None = None,
+    ) -> CreatedHost:
+        """Создать хост — строку подключения, которую панель отдаёт в подписке.
+
+        Один хост на один инбаунд ноды. Параметры (security/sni/path/...) приходят
+        из генератора Xray-конфига, оператор их не вводит (ADR 0008).
+        """
+        body = _build_create_host_request(
+            inbound_uuid=inbound_uuid,
+            config_profile_uuid=config_profile_uuid,
+            remark=remark,
+            address=address,
+            port=port,
+            node_uuid=node_uuid,
+            security=security,
+            sni=sni,
+            host=host,
+            path=path,
+            fingerprint=fingerprint,
+            alpn=alpn,
+        )
+        resp = await self._sdk.hosts.create_host(body=body)
+        return CreatedHost(
+            uuid=str(resp.uuid),
+            remark=resp.remark,
+            address=resp.address,
+            port=resp.port,
+        )
+
+    async def list_internal_squads(self) -> list[InternalSquadRef]:
+        """Внутренние сквады панели с их инбаундами (для выбора в боте и для
+        read-modify-write при привязке)."""
+        resp = await self._sdk.internal_squads.get_internal_squads()
+        return [
+            InternalSquadRef(
+                uuid=str(s.uuid),
+                name=s.name,
+                inbound_uuids=[str(inb.uuid) for inb in s.inbounds],
+            )
+            for s in resp.internal_squads
+        ]
+
+    async def add_inbounds_to_squads(
+        self, squad_uuids: list[str], new_inbound_uuids: list[str]
+    ) -> None:
+        """Дописать инбаунды в указанные сквады (read-modify-write).
+
+        update_internal_squad заменяет список инбаундов целиком, поэтому сначала
+        читаем текущий состав каждого сквада, объединяем со своими (без дублей,
+        порядок сохраняем) и отправляем обратно. Сквады панели читаем один раз.
+        """
+        if not squad_uuids or not new_inbound_uuids:
+            return
+        by_uuid = {s.uuid: s for s in await self.list_internal_squads()}
+        add = [str(u) for u in new_inbound_uuids]
+        for su in squad_uuids:
+            squad = by_uuid.get(str(su))
+            if squad is None:
+                raise ValueError(f"внутренний сквад {su} не найден в панели")
+            merged = list(dict.fromkeys(squad.inbound_uuids + add))
+            body = _build_update_squad_request(squad.uuid, merged)
+            await self._sdk.internal_squads.update_internal_squad(body=body)

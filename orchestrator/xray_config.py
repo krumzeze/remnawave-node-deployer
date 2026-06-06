@@ -36,6 +36,10 @@ DEFAULT_REALITY_SERVER_NAMES = ("www.microsoft.com",)
 # Метод Shadowsocks: AEAD-2022, ключ сервера выводим из 32 случайных байт.
 DEFAULT_SS_METHOD = "2022-blake3-aes-256-gcm"
 
+# uTLS-отпечаток клиента для host'ов reality/tls. firefox вместо chrome: на части
+# нод в РФ chrome-отпечаток стал выбиваться DPI, firefox держится стабильнее.
+DEFAULT_FINGERPRINT = "firefox"
+
 
 class InboundChoice(str, enum.Enum):
     """Пункты меню inbound'ов из ADR 0005."""
@@ -87,6 +91,24 @@ class RealityKeys:
 
 
 @dataclass
+class HostHint:
+    """Параметры для заведения host'а на инбаунд (ADR 0008).
+
+    Хост — это то, что панель отдаёт в подписку пользователю. Все поля выводятся
+    из того, как мы собрали инбаунд, поэтому оператор их не вводит. security —
+    доменная строка («reality»/«tls»/«none»), её мапит на SecurityLayer клиент.
+    sni для Reality — это сайт-донор (serverName), для TLS — домен ноды. path —
+    для ws/xhttp путь, для grpc — serviceName; для остальных None.
+    """
+
+    security: str
+    network: str
+    sni: str | None = None
+    path: str | None = None
+    fingerprint: str | None = None
+
+
+@dataclass
 class GeneratedProfile:
     """Результат сборки профиля.
 
@@ -101,6 +123,46 @@ class GeneratedProfile:
     # Раскладка портов tag→port: какой inbound на каком порту сел. Нужна выше по
     # стеку, чтобы открыть в UFW ровно занятые порты, а не весь пул вслепую.
     ports: dict[str, int] = field(default_factory=dict)
+    # Подсказки для заведения host'ов: tag→HostHint (ADR 0008).
+    hosts: dict[str, HostHint] = field(default_factory=dict)
+
+
+# Раскладка транспорта/безопасности по пунктам меню: из неё строятся host'ы.
+# Держим отдельной таблицей, а не вытаскиваем из готового streamSettings, чтобы
+# host-подсказка не зависела от формата Xray-конфига.
+_HOST_SHAPE: dict[InboundChoice, dict] = {
+    InboundChoice.VLESS_REALITY_TCP: {"security": "reality", "network": "tcp"},
+    InboundChoice.VLESS_XHTTP_REALITY: {"security": "reality", "network": "xhttp", "path": "/"},
+    InboundChoice.VLESS_GRPC_REALITY: {"security": "reality", "network": "grpc", "path": "grpc"},
+    InboundChoice.VLESS_XHTTP_TLS: {"security": "tls", "network": "xhttp", "path": "/"},
+    InboundChoice.TROJAN_WS_TLS: {"security": "tls", "network": "ws", "path": "/"},
+    InboundChoice.SHADOWSOCKS: {"security": "none", "network": "tcp"},
+}
+
+
+def _host_hint(choice: InboundChoice, *, server_names: list[str],
+               tls_domain: str | None) -> HostHint:
+    """Собрать HostHint для инбаунда: sni и fingerprint зависят от security."""
+    shape = _HOST_SHAPE[choice]
+    security = shape["security"]
+    # uTLS-отпечаток: firefox. chrome в РФ сейчас выбивается DPI на ряде нод,
+    # firefox-отпечаток работает стабильнее — поэтому он дефолт для reality/tls.
+    if security == "reality":
+        sni = server_names[0] if server_names else None
+        fingerprint = DEFAULT_FINGERPRINT
+    elif security == "tls":
+        sni = tls_domain
+        fingerprint = DEFAULT_FINGERPRINT
+    else:
+        sni = None
+        fingerprint = None
+    return HostHint(
+        security=security,
+        network=shape["network"],
+        sni=sni,
+        path=shape.get("path"),
+        fingerprint=fingerprint,
+    )
 
 
 def generate_reality_keys(*, short_id_count: int = 3) -> RealityKeys:
@@ -304,6 +366,7 @@ def build_profile(
     tags: list[str] = []
     reality_keys: dict[str, RealityKeys] = {}
     ports_by_tag: dict[str, int] = {}
+    hosts: dict[str, HostHint] = {}
 
     for choice in ordered:
         keys = generate_reality_keys() if choice in REALITY_CHOICES else None
@@ -316,6 +379,11 @@ def build_profile(
         inbounds.append(inbound)
         tags.append(inbound["tag"])
         ports_by_tag[inbound["tag"]] = ports[choice]
+        hosts[inbound["tag"]] = _host_hint(
+            choice,
+            server_names=list(reality_server_names),
+            tls_domain=tls_domain,
+        )
         if keys is not None:
             reality_keys[inbound["tag"]] = keys
 
@@ -330,5 +398,6 @@ def build_profile(
     }
 
     return GeneratedProfile(
-        config=config, tags=tags, reality_keys=reality_keys, ports=ports_by_tag
+        config=config, tags=tags, reality_keys=reality_keys, ports=ports_by_tag,
+        hosts=hosts,
     )
