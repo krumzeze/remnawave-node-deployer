@@ -10,6 +10,12 @@
 - name: Issue TLS certificate via acme.sh (HTTP-01)
   hosts: all
   become: true
+  # При не-root логине sudo не подменяет HOME на /root: установщик acme.sh
+  # кладёт себя в $HOME/.acme.sh логин-пользователя, и шаги ниже (Select ACME CA,
+  # Issue) не находят /root/.acme.sh/acme.sh. Фиксируем HOME на весь play, чтобы
+  # установщик и сам acme.sh всегда работали с {{ acme_home }}.
+  environment:
+    HOME: /root
   vars:
     cert_domain: ""                       # передаётся из оркестратора
     cert_email: ""                         # для регистрации аккаунта ACME
