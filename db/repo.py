@@ -170,6 +170,31 @@ async def get_node_for_owner(
         return node
 
 
+async def list_node_audit(
+    session_factory: async_sessionmaker, node_id: int, owner_tg_id: int
+) -> list[dict]:
+    """История переходов состояний ноды для владельца.
+
+    Возвращает записи Task (пишутся через record_status) в хронологическом
+    порядке. Если нода не принадлежит владельцу — пустой список, не ошибка:
+    вызывающий код (веб-слой) сам решает, вернуть 404 или [].
+    """
+    node = await get_node_for_owner(session_factory, node_id, owner_tg_id)
+    if node is None:
+        return []
+    async with session_factory() as session:
+        rows = await session.scalars(
+            select(TaskRow)
+            .where(TaskRow.node_id == node_id)
+            .order_by(TaskRow.id)
+        )
+        return [
+            {"id": t.id, "state": t.state, "detail": t.detail,
+             "updated_at": t.updated_at.isoformat() if t.updated_at else None}
+            for t in rows.all()
+        ]
+
+
 async def delete_node(
     session_factory: async_sessionmaker, node_id: int, owner_tg_id: int
 ) -> bool:
