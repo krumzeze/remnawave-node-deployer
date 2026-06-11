@@ -7,10 +7,11 @@ inbound'ы → донор/страна → сквады → подтвержде
 ставит задачу provision_node в очередь arq; воркер гоняет конвейер и шлёт
 статусы в этот же чат (orchestrator/reporting.py).
 
-Секреты: пароль сервера идёт только в payload задачи и стирается в bootstrap,
-в БД его нет. Токен панели кладём в Vault, в БД (Panel.token_vault_path) — лишь
-путь. Приватный ключ ветки «ключ» генерим мы, в Vault его положит воркер после
-проверки доступа.
+Секреты: пароль/ключ сервера и токен панели в payload задачи не кладём — он
+лежит в Redis открытым текстом до выборки воркером. Доступ-секрет bootstrap
+пишем в Vault на транзитный путь и отдаём воркеру только путь; воркер стирает
+его сразу после bootstrap. Токен панели тоже в Vault, в payload — лишь путь.
+В БД секретов нет, только пути (Panel.token_vault_path).
 
 Состояние мастера (FSM) хранится в Redis (см. bot/__main__.py), поэтому
 незавершённый диалог и сохранённая панель/ноды переживают перезапуск бота.
@@ -178,11 +179,20 @@ def toggle_index(selected: list[int], idx: int) -> list[int]:
     return [*selected, idx]
 
 
-def build_payload(data: dict, *, node_id: int, chat_id: int) -> dict:
+def build_payload(
+    data: dict, *, node_id: int, chat_id: int,
+    secret_vault_path: str, panel_token_vault_path: str,
+) -> dict:
     """Собрать payload задачи provision_node из данных FSM.
 
-    node_id/chat_id нужны воркеру для отчётности; auth определяет, что кладём —
-    password (стирается в bootstrap) или сгенерированный private_key.
+    Секреты в payload не кладём: он сериализуется в Redis открытым текстом, пока
+    воркер не заберёт задачу. Сам пароль/ключ доступа и токен панели лежат в
+    Vault, а в payload идут только пути к ним: secret_vault_path (транзитный
+    bootstrap-секрет {"auth", "password"|"private_key"}) и panel_token_vault_path
+    (токен панели по panels/{owner}/token). auth остаётся в payload — это лишь
+    признак способа доступа («password»/«key»), не секрет.
+
+    node_id/chat_id нужны воркеру для отчётности.
     """
     payload: dict = {
         "node_id": node_id,
@@ -191,16 +201,12 @@ def build_payload(data: dict, *, node_id: int, chat_id: int) -> dict:
         "login": data.get("login", "root"),
         "auth": data["auth"],
         "panel_mode": data.get("panel_mode", "existing"),
+        "secret_vault_path": secret_vault_path,
+        "panel_token_vault_path": panel_token_vault_path,
     }
-    if data.get("auth") == "password":
-        payload["password"] = data.get("password", "")
-    else:
-        payload["private_key"] = data.get("private_key", "")
 
     if data.get("panel_url"):
         payload["panel_url"] = data["panel_url"]
-    if data.get("panel_token"):
-        payload["panel_token"] = data["panel_token"]
     if data.get("inbounds"):
         payload["inbounds"] = data["inbounds"]
     if data.get("tls_domain"):
@@ -836,7 +842,23 @@ async def wiz_confirm(query: CallbackQuery, state: FSMContext) -> None:
     )
     node_id = await create_node_record(sm, panel_id=panel_id, ip=ip)
 
-    payload = build_payload(data, node_id=node_id, chat_id=query.message.chat.id)
+    # Секреты не идут в payload очереди (он лежит в Redis открытым текстом до
+    # того, как воркер заберёт задачу). Доступ-секрет bootstrap кладём в Vault
+    # на транзитный путь и передаём воркеру только путь; токен панели воркер
+    # возьмёт из panels/{owner}/token, куда его уже положил _save_panel.
+    from secretstore.vault import VaultStore
+
+    secret_path = f"transient/nodes/{node_id}/bootstrap"
+    if data.get("auth") == "password":
+        bootstrap_secret = {"auth": "password", "password": data.get("password", "")}
+    else:
+        bootstrap_secret = {"auth": "key", "private_key": data.get("private_key", "")}
+    VaultStore().put(secret_path, bootstrap_secret)
+
+    payload = build_payload(
+        data, node_id=node_id, chat_id=query.message.chat.id,
+        secret_vault_path=secret_path, panel_token_vault_path=token_path,
+    )
     queue = await _get_queue()
     await queue.enqueue_job("provision_node", payload)
 

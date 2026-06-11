@@ -62,12 +62,21 @@ def test_build_payload_password_branch():
         "password": "secret",
         "inbounds": ["shadowsocks"],
     }
-    payload = handlers.build_payload(data, node_id=5, chat_id=42)
+    payload = handlers.build_payload(
+        data, node_id=5, chat_id=42,
+        secret_vault_path="transient/nodes/5/bootstrap",
+        panel_token_vault_path="panels/7/token",
+    )
 
     assert payload["node_id"] == 5
     assert payload["chat_id"] == 42
-    assert payload["password"] == "secret"
+    # Секреты в payload не попадают — только пути к ним в Vault. auth остаётся.
+    assert "password" not in payload
     assert "private_key" not in payload
+    assert "panel_token" not in payload
+    assert payload["auth"] == "password"
+    assert payload["secret_vault_path"] == "transient/nodes/5/bootstrap"
+    assert payload["panel_token_vault_path"] == "panels/7/token"
     assert payload["panel_url"] == "https://p"
     assert payload["inbounds"] == ["shadowsocks"]
     # домена не было — в payload его нет
@@ -84,10 +93,16 @@ def test_build_payload_key_branch_omits_password():
         "private_key": "PRIVKEY",
         "inbounds": None,
     }
-    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    payload = handlers.build_payload(
+        data, node_id=1, chat_id=1,
+        secret_vault_path="transient/nodes/1/bootstrap",
+        panel_token_vault_path="panels/7/token",
+    )
 
-    assert payload["private_key"] == "PRIVKEY"
+    assert "private_key" not in payload
     assert "password" not in payload
+    assert payload["auth"] == "key"
+    assert payload["secret_vault_path"] == "transient/nodes/1/bootstrap"
     # inbounds=None (все) в payload не кладём — воркер подставит дефолт.
     assert "inbounds" not in payload
 
@@ -103,7 +118,11 @@ def test_build_payload_carries_tls_domain():
         "inbounds": [InboundChoice.VLESS_XHTTP_TLS.value],
         "tls_domain": "vpn.example.com",
     }
-    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    payload = handlers.build_payload(
+        data, node_id=1, chat_id=1,
+        secret_vault_path="transient/nodes/1/bootstrap",
+        panel_token_vault_path="panels/7/token",
+    )
     assert payload["tls_domain"] == "vpn.example.com"
 
 
@@ -180,7 +199,11 @@ def test_build_payload_carries_reality_donor_and_country():
         "reality_server_names": ["www.cloudflare.com"],
         "country_code": "NL",
     }
-    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    payload = handlers.build_payload(
+        data, node_id=1, chat_id=1,
+        secret_vault_path="transient/nodes/1/bootstrap",
+        panel_token_vault_path="panels/7/token",
+    )
     assert payload["reality_dest"] == "www.cloudflare.com:443"
     assert payload["reality_server_names"] == ["www.cloudflare.com"]
     assert payload["country_code"] == "NL"
@@ -196,7 +219,11 @@ def test_build_payload_omits_reality_donor_and_country_when_absent():
         "private_key": "PRIVKEY",
         "inbounds": None,
     }
-    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    payload = handlers.build_payload(
+        data, node_id=1, chat_id=1,
+        secret_vault_path="transient/nodes/1/bootstrap",
+        panel_token_vault_path="panels/7/token",
+    )
     # Не задано → в payload не кладём, воркер подставит дефолты (донор/«XX»).
     assert "reality_dest" not in payload
     assert "reality_server_names" not in payload
@@ -241,7 +268,11 @@ def test_build_payload_carries_squad_uuids():
         "ip": "1.2.3.4", "login": "root", "auth": "key", "private_key": "K",
         "inbounds": None, "squad_uuids": ["sq-2"],
     }
-    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    payload = handlers.build_payload(
+        data, node_id=1, chat_id=1,
+        secret_vault_path="transient/nodes/1/bootstrap",
+        panel_token_vault_path="panels/7/token",
+    )
     assert payload["squad_uuids"] == ["sq-2"]
 
 
@@ -251,5 +282,9 @@ def test_build_payload_omits_squads_when_absent():
         "ip": "1.2.3.4", "login": "root", "auth": "key", "private_key": "K",
         "inbounds": None,
     }
-    payload = handlers.build_payload(data, node_id=1, chat_id=1)
+    payload = handlers.build_payload(
+        data, node_id=1, chat_id=1,
+        secret_vault_path="transient/nodes/1/bootstrap",
+        panel_token_vault_path="panels/7/token",
+    )
     assert "squad_uuids" not in payload

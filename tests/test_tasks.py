@@ -108,6 +108,17 @@ def _generated(tags):
     )
 
 
+def _default_vault_get(path):
+    """Фейковый Vault для счастливого пути: транзитный bootstrap-секрет (пароль)
+    и токен панели. Ключ ноды по nodes/... не сохранён — KeyError, чтобы resume
+    по умолчанию не срабатывал."""
+    if path.startswith("transient/"):
+        return {"auth": "password", "password": "secret"}
+    if path.startswith("panels/"):
+        return {"token": "tok"}
+    raise KeyError(path)
+
+
 def _deps(*, client, **over):
     """Собрать ProvisionDeps со счастливыми дефолтами и инъекцией клиента."""
     reports = over.pop("reports")
@@ -140,6 +151,7 @@ def _deps(*, client, **over):
         sleep=sleep,
         poll_attempts=3,
         poll_interval_sec=0,
+        vault_get=_default_vault_get,
     )
     for k, v in over.items():
         setattr(deps, k, v)
@@ -148,12 +160,13 @@ def _deps(*, client, **over):
 
 def _payload(**over):
     p = {
+        "node_id": 1,
         "ip": "1.2.3.4",
         "login": "root",
         "auth": "password",
-        "password": "secret",
         "panel_url": "https://panel.example",
-        "panel_token": "tok",
+        "secret_vault_path": "transient/nodes/1/bootstrap",
+        "panel_token_vault_path": "panels/7/token",
     }
     p.update(over)
     return p
@@ -368,7 +381,9 @@ async def test_reality_donor_defaults_when_absent():
 
 
 @pytest.mark.asyncio
-async def test_vault_put_called_with_key_not_password():
+async def test_vault_put_uses_node_id_path_not_ip():
+    # Ключ ноды адресуется по node_id, а не по IP — две ноды с одним IP не
+    # перетирают ключ друг друга.
     reports = []
     stored = {}
     client = _FakeClient([NodeConnState.ONLINE])
@@ -379,7 +394,41 @@ async def test_vault_put_called_with_key_not_password():
     deps = _deps(client=client, reports=reports, vault_put=vault_put)
     await tasks.provision_node({"deps": deps}, _payload())
 
-    assert stored == {"nodes/1.2.3.4/ssh": {"private_key": "PRIVKEY"}}
+    assert stored == {"nodes/1/ssh": {"private_key": "PRIVKEY"}}
+
+
+@pytest.mark.asyncio
+async def test_transient_secret_deleted_after_bootstrap():
+    # Транзитный bootstrap-секрет читается из Vault и стирается после успешного
+    # перехода на ключ — в payload его нет, в Vault он не задерживается.
+    reports = []
+    client = _FakeClient([NodeConnState.ONLINE])
+    deleted = []
+
+    deps = _deps(
+        client=client, reports=reports,
+        vault_delete=lambda path: deleted.append(path),
+    )
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    assert deleted == ["transient/nodes/1/bootstrap"]
+    assert NodeState.ONLINE in reports
+
+
+@pytest.mark.asyncio
+async def test_panel_token_read_from_vault():
+    # Токен панели берётся из Vault по panel_token_vault_path, а не из payload.
+    reads = []
+    client = _FakeClient([NodeConnState.ONLINE])
+
+    def vault_get(path):
+        reads.append(path)
+        return _default_vault_get(path)
+
+    deps = _deps(client=client, reports=[], vault_get=vault_get)
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    assert "panels/7/token" in reads
 
 
 @pytest.mark.asyncio
@@ -399,8 +448,10 @@ async def test_resume_uses_stored_key_skips_password():
         return BootstrapResult(ok=True, private_key=private_key)
 
     def vault_get(path):
-        assert path == "nodes/1.2.3.4/ssh"
-        return {"private_key": "STORED"}
+        # Ключ ноды сохранён по node_id; транзит/панель отдаём как обычно.
+        if path == "nodes/1/ssh":
+            return {"private_key": "STORED"}
+        return _default_vault_get(path)
 
     deps = _deps(
         client=client, reports=reports,
@@ -428,10 +479,15 @@ async def test_resume_falls_back_when_stored_key_bad():
     async def bootstrap_key(ip, login, private_key):
         return BootstrapResult(ok=False, detail="ключ не принят")
 
+    def vault_get(path):
+        if path == "nodes/1/ssh":
+            return {"private_key": "STORED"}
+        return _default_vault_get(path)
+
     deps = _deps(
         client=client, reports=reports,
         bootstrap_password=bootstrap_password, bootstrap_key=bootstrap_key,
-        vault_get=lambda path: {"private_key": "STORED"},
+        vault_get=vault_get,
     )
     await tasks.provision_node({"deps": deps}, _payload())
 
@@ -451,7 +507,11 @@ async def test_no_stored_key_uses_payload_auth():
         return BootstrapResult(ok=True, private_key=private_key)
 
     def vault_get(path):
-        raise KeyError("нет такого пути")
+        # Ключ ноды для этого node_id не сохранён → resume не срабатывает.
+        # Транзитный секрет и токен панели доступны как обычно.
+        if path.startswith("nodes/"):
+            raise KeyError("нет такого пути")
+        return _default_vault_get(path)
 
     deps = _deps(
         client=client, reports=reports,
@@ -537,12 +597,27 @@ async def test_new_panel_mode_rejected():
 async def test_key_branch_uses_private_key():
     reports = []
     client = _FakeClient([NodeConnState.ONLINE])
-    deps = _deps(client=client, reports=reports)
+    key_calls = []
 
-    payload = _payload(auth="key", private_key="MYKEY")
-    payload.pop("password")
-    await tasks.provision_node({"deps": deps}, payload)
+    async def bootstrap_key(ip, login, private_key):
+        key_calls.append(private_key)
+        return BootstrapResult(ok=True, private_key=private_key)
 
+    def vault_get(path):
+        # Транзитный секрет для ветки «ключ» несёт private_key, не пароль.
+        if path.startswith("transient/"):
+            return {"auth": "key", "private_key": "MYKEY"}
+        if path.startswith("nodes/"):
+            raise KeyError(path)
+        return _default_vault_get(path)
+
+    deps = _deps(
+        client=client, reports=reports,
+        bootstrap_key=bootstrap_key, vault_get=vault_get,
+    )
+    await tasks.provision_node({"deps": deps}, _payload(auth="key"))
+
+    assert key_calls == ["MYKEY"]    # ключ взят из транзитного секрета Vault
     assert NodeState.ONLINE in reports
 
 

@@ -167,6 +167,9 @@ class ProvisionDeps:
     make_client: Callable[[str, str], RemnawaveClient] = _default_make_client
     vault_put: Callable[[str, dict], Any] | None = None
     vault_get: Callable[[str], dict] | None = None
+    # Удаление транзитного bootstrap-секрета из Vault после успешного перехода
+    # на ключ. None — шаг пропускается (например, в тестах без проверки стирания).
+    vault_delete: Callable[[str], Any] | None = None
     # Запись uuid ноды/пути ключа в строку Node. Привязан к node_id, поэтому
     # достраивается в build_production_deps; по умолчанию None — шаг пропускается.
     persist_node: Callable[..., Awaitable[None]] | None = None
@@ -208,71 +211,138 @@ class _Pipeline:
         except ValueError as exc:
             raise ProvisionError(f"неизвестный inbound в payload: {exc}") from exc
 
-    def _load_stored_key(self, ip: str) -> str | None:
+    def _key_vault_path(self) -> str | None:
+        """Путь приватного ключа ноды в Vault — по node_id, не по IP.
+
+        Адресация по node_id разводит ноды с одним IP (переиспользованный VPS
+        или повторное добавление): они больше не делят и не перетирают ключ.
+        node_id есть в payload; если его (теоретически) нет — фолбэк на IP, чтобы
+        хотя бы сохранить ключ, а не потерять его молча."""
+        node_id = self.p.get("node_id")
+        if node_id is not None:
+            return f"nodes/{node_id}/ssh"
+        ip = self.p.get("ip")
+        return f"nodes/{ip}/ssh" if ip else None
+
+    def _load_stored_key(self) -> str | None:
         """Достать ранее сохранённый приватный ключ ноды из Vault.
 
         Ключ туда кладёт `_store_key` после первого успешного bootstrap. Если
         Vault недоступен, пути нет или ключ пуст — возвращаем None и идём по
         обычной развилке. Любая ошибка чтения не должна ронять провижн, поэтому
         ловим широко."""
-        if self.deps.vault_get is None:
+        path = self._key_vault_path()
+        if self.deps.vault_get is None or path is None:
             return None
         try:
-            data = self.deps.vault_get(f"nodes/{ip}/ssh")
+            data = self.deps.vault_get(path)
         except Exception:  # noqa: BLE001 — нет ключа/Vault недоступен → просто без resume
             return None
         key = (data or {}).get("private_key")
         return key or None
 
+    def _panel_token(self) -> str | None:
+        """Токен панели из Vault по panel_token_vault_path (panels/{owner}/token).
+
+        В payload токена нет — туда кладётся только путь. Если путь не задан или
+        Vault недоступен — возвращаем None, выше сработает фолбэк на
+        settings.remnawave_api_token."""
+        path = self.p.get("panel_token_vault_path")
+        if self.deps.vault_get is None or not path:
+            return None
+        try:
+            data = self.deps.vault_get(path)
+        except Exception:  # noqa: BLE001 — нет токена/Vault недоступен → фолбэк на settings
+            return None
+        return (data or {}).get("token") or None
+
+    def _read_bootstrap_secret(self) -> dict:
+        """Прочитать транзитный bootstrap-секрет из Vault по secret_vault_path.
+
+        В payload секрета нет — там только путь (см. build_payload бота). По пути
+        лежит {"auth": ..., "password"|"private_key": ...}. Без vault_get или без
+        пути читать неоткуда — это конфигурационная ошибка постановки задачи."""
+        path = self.p.get("secret_vault_path")
+        if self.deps.vault_get is None or not path:
+            raise ProvisionError("нет доступа к секрету bootstrap (secret_vault_path)")
+        try:
+            data = self.deps.vault_get(path)
+        except Exception as exc:  # noqa: BLE001 — нет секрета/Vault недоступен
+            raise ProvisionError(f"секрет bootstrap недоступен: {exc}") from exc
+        return data or {}
+
+    def _drop_bootstrap_secret(self) -> None:
+        """Стереть транзитный bootstrap-секрет из Vault — он больше не нужен.
+
+        Best-effort: ошибка удаления (нет пути, Vault недоступен) не должна
+        валить уже состоявшийся провижн, только логируем."""
+        path = self.p.get("secret_vault_path")
+        if self.deps.vault_delete is None or not path:
+            return
+        try:
+            self.deps.vault_delete(path)
+        except Exception:  # noqa: BLE001 — удаление транзита не критично для провижина
+            logger.exception("не удалось стереть транзитный секрет bootstrap")
+
     async def _bootstrap(self) -> str:
         """Детекция + перевод сервера на ключ. Возвращает приватный ключ.
 
-        Resume (ADR 0002, «не навреди»): если для этого IP уже есть ключ в Vault
-        (прошлый bootstrap прошёл), сервер уже переведён на ключ и пароль на нём,
-        скорее всего, отключён. Тогда заходим сохранённым ключом и пропускаем
-        перевод на ключ — это и делает повторный провижн (ретрай после сбоя на
-        более позднем шаге) самодостаточным: пароль вводить повторно не нужно.
-        Ключ перед использованием проверяется внутри bootstrap_key; если не
-        подошёл — откатываемся на заданный в payload способ доступа."""
+        Доступ-секрет (пароль или ключ) берём из Vault по secret_vault_path, а
+        не из payload — в payload его нет. После успешного перехода на ключ
+        транзитный секрет больше не нужен и стирается из Vault.
+
+        Resume (ADR 0002, «не навреди»): если для этой ноды (по node_id) уже есть
+        ключ в Vault (прошлый bootstrap прошёл), сервер уже переведён на ключ и
+        пароль на нём, скорее всего, отключён. Тогда заходим сохранённым ключом и
+        пропускаем перевод на ключ — это и делает повторный провижн (ретрай после
+        сбоя на более позднем шаге) самодостаточным: секрет вводить повторно не
+        нужно. Ключ перед использованием проверяется внутри bootstrap_key; если
+        не подошёл — откатываемся на заданный способ доступа."""
         ip = self.p["ip"]
         login = self.p["login"]
         auth = self.p["auth"]
         await self._advance(NodeState.BOOTSTRAPPING, f"Подключаюсь к {ip} ({auth})")
 
-        stored_key = self._load_stored_key(ip)
+        stored_key = self._load_stored_key()
         if stored_key:
             await self.deps.report(
                 self.state, "Нашёл сохранённый ключ ноды — захожу по нему"
             )
             result = await self.deps.bootstrap_key(ip, login, stored_key)
             if result.ok and result.private_key:
+                self._drop_bootstrap_secret()
                 return result.private_key
             await self.deps.report(
                 self.state,
                 "Сохранённый ключ не подошёл — пробую заданный способ доступа",
             )
 
+        secret = self._read_bootstrap_secret()
         if auth == "password":
             result = await self.deps.bootstrap_password(
-                ip, login, self.p["password"]
+                ip, login, secret.get("password", "")
             )
         elif auth == "key":
             result = await self.deps.bootstrap_key(
-                ip, login, self.p["private_key"]
+                ip, login, secret.get("private_key", "")
             )
         else:
             raise ProvisionError(f"неизвестный способ доступа: {auth!r}")
 
         if not result.ok or not result.private_key:
             raise ProvisionError(result.detail or "bootstrap не удался")
+        self._drop_bootstrap_secret()
         return result.private_key
 
-    def _store_key(self, ip: str, private_key: str) -> None:
-        """Положить приватный ключ в Vault. В БД пишется только путь (vault_path),
-        сам ключ — никогда (см. db/models.py, секреты только в Vault)."""
-        if self.deps.vault_put is None:
+    def _store_key(self, private_key: str) -> None:
+        """Положить приватный ключ в Vault по пути ноды (node_id). В БД пишется
+        только путь (vault_path), сам ключ — никогда (см. db/models.py, секреты
+        только в Vault). Если путь не определить (нет ни node_id, ни ip) — store
+        пропускаем, ронять провижн из-за этого не стоит."""
+        path = self._key_vault_path()
+        if self.deps.vault_put is None or path is None:
             return
-        self.deps.vault_put(f"nodes/{ip}/ssh", {"private_key": private_key})
+        self.deps.vault_put(path, {"private_key": private_key})
 
     async def _persist_node(
         self, *, remnawave_uuid: str | None = None,
@@ -375,14 +445,16 @@ class _Pipeline:
             )
 
         panel_url = self.p.get("panel_url") or settings.remnawave_panel_url
-        panel_token = self.p.get("panel_token") or settings.remnawave_api_token
+        panel_token = self._panel_token() or settings.remnawave_api_token
         if not panel_url or not panel_token:
             raise ProvisionError("не заданы URL/токен панели")
 
         # 1. Bootstrap: сервер переходит на ключевую аутентификацию.
         private_key = await self._bootstrap()
-        self._store_key(ip, private_key)
-        await self._persist_node(ssh_key_vault_path=f"nodes/{ip}/ssh")
+        self._store_key(private_key)
+        key_path = self._key_vault_path()
+        if key_path:
+            await self._persist_node(ssh_key_vault_path=key_path)
 
         # 2. Provisioning: hardening + разворот контейнера ноды.
         await self._advance(NodeState.PROVISIONING, "Настраиваю сервер")
@@ -614,7 +686,9 @@ def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
     vault = VaultStore()
     if node_id is None:
         # Без node_id обновлять в БД нечего — оставляем лог-заглушку.
-        return ProvisionDeps(vault_put=vault.put, vault_get=vault.get)
+        return ProvisionDeps(
+            vault_put=vault.put, vault_get=vault.get, vault_delete=vault.delete,
+        )
 
     session_factory = get_sessionmaker()
 
@@ -641,18 +715,20 @@ def build_production_deps(ctx: dict, payload: dict) -> ProvisionDeps:
     )
     return ProvisionDeps(
         report=report, vault_put=vault.put, vault_get=vault.get,
-        persist_node=persist_node,
+        vault_delete=vault.delete, persist_node=persist_node,
     )
 
 
 async def provision_node(ctx: dict, payload: dict) -> None:
     """Полный цикл провижининга ноды.
 
-    payload (из FSM-диалога бота): ip, login, auth (password|key) и либо password,
-    либо private_key; node_id и chat_id для отчётности; опционально
-    panel_url/panel_token, inbounds, country_code, tls_domain,
-    reality_dest/reality_server_names (донор Reality, ADR 0007).
-    Пароль живёт только в payload задачи и стирается в bootstrap; в БД он не пишется.
+    payload (из FSM-диалога бота): ip, login, auth (password|key); node_id и
+    chat_id для отчётности; secret_vault_path — путь к транзитному bootstrap-
+    секрету в Vault ({"auth", "password"|"private_key"}), стираемому после
+    bootstrap; panel_token_vault_path — путь к токену панели в Vault. Опционально
+    panel_url, inbounds, country_code, tls_domain, reality_dest/
+    reality_server_names (донор Reality, ADR 0007). Сами секреты в payload не
+    лежат и в БД не пишутся — только пути в Vault.
 
     Зависимости берутся из ctx["deps"] (ProvisionDeps) — это путь тестов; в проде
     их там нет, и собираются боевые через build_production_deps.

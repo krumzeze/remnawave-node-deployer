@@ -27,4 +27,18 @@ class VaultStore:
         )
         return resp["data"]["data"]
 
+    def delete(self, path: str) -> None:
+        """Удалить секрет целиком (все версии и метаданные).
+
+        Нужен для одноразовых транзитных секретов bootstrap: пароль/ключ
+        доступа кладём в Vault только чтобы провести его до воркера мимо
+        payload очереди, а после успешного bootstrap стираем. Отсутствие пути
+        — не ошибка (нечего удалять), поэтому глушим исключение."""
+        try:
+            self._client.secrets.kv.v2.delete_metadata_and_all_versions(
+                path=path, mount_point=self._mount
+            )
+        except Exception:  # noqa: BLE001 — нет пути/Vault недоступен → удалять нечего
+            pass
+
     # TODO: ротация per-node ключей; политики доступа на тенанта
