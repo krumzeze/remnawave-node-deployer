@@ -12,6 +12,7 @@ from orchestrator import ansible_runner, tasks
 from orchestrator.remnawave_client import (
     CreatedHost,
     CreatedProfile,
+    HostRef,
     InternalSquadRef,
     NodeConnState,
     NodeInfo,
@@ -24,11 +25,14 @@ from orchestrator.xray_config import GeneratedProfile, HostHint, InboundChoice
 class _FakeClient:
     """Фейковая панель: фиксирует вызовы и отдаёт заданный статус ноды."""
 
-    def __init__(self, statuses):
+    def __init__(self, statuses, existing_hosts=None):
         # statuses — очередь ответов get_node_status (последний повторяется).
         self._statuses = list(statuses)
         self.created_profile_config = None
         self.create_node_kwargs = None
+        # Существующие хосты панели для дедупа при повторном провижене; по
+        # умолчанию пусто — значит создаём все (поведение чистого провижина).
+        self._existing_hosts = list(existing_hosts or [])
 
     async def get_panel_pubkey(self):
         return "PANEL_PUBKEY"
@@ -57,6 +61,10 @@ class _FakeClient:
         if len(self._statuses) > 1:
             return self._statuses.pop(0)
         return self._statuses[0]
+
+    async def list_hosts(self):
+        # Хосты, уже заведённые в панели (для дедупа при повторном провижене).
+        return list(self._existing_hosts)
 
     async def create_host(self, **kwargs):
         # Накапливаем заведённые хосты для проверок (ADR 0008).
@@ -204,6 +212,52 @@ async def test_publish_creates_hosts_and_links_squads():
     squads, inbounds = client.squads_called
     assert squads == ["sq-1", "sq-2"]
     assert inbounds == ["inb-a", "inb-b", "inb-c", "inb-d"]
+
+
+@pytest.mark.asyncio
+async def test_publish_skips_existing_hosts_no_dups():
+    # Повторный провижн той же ноды: все хосты уже есть в панели → не плодим
+    # дубли, create_host не зовётся ни разу. Сверка по (address, port) +
+    # inbound_uuid. Дефолтный набор — четыре инбаунда на IP ноды.
+    reports = []
+    existing = [
+        HostRef(uuid="h-a", remark="", address="1.2.3.4", port=443,
+                inbound_uuid="inb-a"),
+        HostRef(uuid="h-b", remark="", address="1.2.3.4", port=8443,
+                inbound_uuid="inb-b"),
+        HostRef(uuid="h-c", remark="", address="1.2.3.4", port=2053,
+                inbound_uuid="inb-c"),
+        HostRef(uuid="h-d", remark="", address="1.2.3.4", port=2083,
+                inbound_uuid="inb-d"),
+    ]
+    client = _FakeClient([NodeConnState.ONLINE], existing_hosts=existing)
+    deps = _deps(client=client, reports=reports)
+
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    assert getattr(client, "hosts_created", []) == []
+    # Сквады при этом всё равно обновляются — дедуп касается только хостов.
+    squads, _ = client.squads_called
+    assert squads == ["sq-1", "sq-2"]
+
+
+@pytest.mark.asyncio
+async def test_publish_creates_only_missing_hosts():
+    # Часть хостов уже есть (inb-a на 443), часть нет → создаём только
+    # недостающие. Хост с тем же адресом, но иным портом не считается дублем.
+    reports = []
+    existing = [
+        HostRef(uuid="h-a", remark="", address="1.2.3.4", port=443,
+                inbound_uuid="inb-a"),
+    ]
+    client = _FakeClient([NodeConnState.ONLINE], existing_hosts=existing)
+    deps = _deps(client=client, reports=reports)
+
+    await tasks.provision_node({"deps": deps}, _payload())
+
+    created = client.hosts_created
+    # inb-a пропущен, остальные три заведены.
+    assert [h["inbound_uuid"] for h in created] == ["inb-b", "inb-c", "inb-d"]
 
 
 @pytest.mark.asyncio
@@ -376,7 +430,7 @@ async def test_resume_falls_back_when_stored_key_bad():
 
     deps = _deps(
         client=client, reports=reports,
-        bootstrap_password=bootstrap_password,
+        bootstrap_password=bootstrap_password, bootstrap_key=bootstrap_key,
         vault_get=lambda path: {"private_key": "STORED"},
     )
     await tasks.provision_node({"deps": deps}, _payload())

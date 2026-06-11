@@ -116,6 +116,23 @@ def _host_remark(country_code: str, fingerprint: str | None) -> str:
     return label[:HOST_REMARK_MAXLEN]
 
 
+def _host_exists(existing, inbound_uuid: str, address: str, port: int) -> bool:
+    """Есть ли среди существующих хостов панели дубль для этого инбаунда.
+
+    Надёжный минимум сверки — совпадение address+port (в нём один инбаунд = один
+    хост). Если у хоста доступен uuid инбаунда, дополнительно требуем, чтобы он
+    совпал: один адрес+порт может нести разные инбаунды (например, разные
+    сети по тому же порту). Если uuid инбаунда недоступен (None), полагаемся
+    только на address+port."""
+    for h in existing:
+        if h.address != address or h.port != port:
+            continue
+        if h.inbound_uuid is not None and h.inbound_uuid != str(inbound_uuid):
+            continue
+        return True
+    return False
+
+
 class ProvisionError(Exception):
     """Шаг конвейера завершился неуспехом. detail — для отчёта оператору."""
 
@@ -490,6 +507,15 @@ class _Pipeline:
         """
         country_code = self.p.get("country_code", "XX")
         await self.deps.report(self.state, "Завожу хосты для подписки")
+
+        # Дедуп при повторном провижене (как идемпотентность create_node и
+        # create_config_profile): один раз читаем хосты панели и не создаём
+        # дубль, если хост на этот инбаунд уже есть на том же адресе и порту.
+        # Если листинг недоступен (пустой список — защитный фолбэк), поведение
+        # прежнее: создаём всё. Сверяем по (address, port) как надёжному
+        # минимуму, а где доступен — ещё и по uuid инбаунда.
+        existing_hosts = await client.list_hosts()
+
         for tag in generated.tags:
             inbound_uuid = profile.tag_to_inbound.get(tag)
             if inbound_uuid is None:
@@ -497,6 +523,12 @@ class _Pipeline:
             hint = generated.hosts.get(tag)
             security = hint.security if hint else "default"
             address = tls_domain if (security == "tls" and tls_domain) else ip
+            port = generated.ports[tag]
+            if _host_exists(existing_hosts, inbound_uuid, address, port):
+                await self.deps.report(
+                    self.state, f"Хост для {address}:{port} уже есть — пропускаю"
+                )
+                continue
             await client.create_host(
                 inbound_uuid=inbound_uuid,
                 config_profile_uuid=profile.uuid,
@@ -504,7 +536,7 @@ class _Pipeline:
                     country_code, hint.fingerprint if hint else None
                 ),
                 address=address,
-                port=generated.ports[tag],
+                port=port,
                 node_uuid=node_uuid,
                 security=security,
                 sni=hint.sni if hint else None,

@@ -68,14 +68,32 @@ class _FakeProfiles:
 
 
 class _FakeHosts:
-    def __init__(self):
+    def __init__(self, hosts_resp=None):
         self.created_body = None
+        # Ответ get_all_hosts; по умолчанию один хост, привязанный к инбаунду
+        # через вложенный inbound (форма как у SDK 2.7.x).
+        if hosts_resp is None:
+            hosts_resp = types.SimpleNamespace(
+                hosts=[
+                    types.SimpleNamespace(
+                        uuid="host-1", remark="NL-01",
+                        address="node.example", port=443,
+                        inbound=types.SimpleNamespace(
+                            config_profile_inbound_uuid="inb-1"
+                        ),
+                    )
+                ]
+            )
+        self._hosts_resp = hosts_resp
 
     async def create_host(self, body):
         self.created_body = body
         return types.SimpleNamespace(
             uuid="host-1", remark="NL-01", address="node.example", port=443
         )
+
+    async def get_all_hosts(self):
+        return self._hosts_resp
 
 
 class _FakeSquads:
@@ -98,11 +116,11 @@ class _FakeSquads:
 
 
 class _FakeSDK:
-    def __init__(self, node):
+    def __init__(self, node, hosts=None):
         self.nodes = _FakeNodes(node)
         self.keygen = _FakeKeygen()
         self.config_profiles = _FakeProfiles()
-        self.hosts = _FakeHosts()
+        self.hosts = hosts if hosts is not None else _FakeHosts()
         self.internal_squads = _FakeSquads()
 
 
@@ -207,6 +225,75 @@ async def test_create_host_maps_response(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_hosts_maps_response():
+    # Нормальный ответ: маппинг полей + uuid инбаунда из вложенного inbound.
+    c = _client(_FakeNode())
+    hosts = await c.list_hosts()
+    assert len(hosts) == 1
+    h = hosts[0]
+    assert h.uuid == "host-1"
+    assert h.remark == "NL-01"
+    assert h.address == "node.example"
+    assert h.port == 443
+    assert h.inbound_uuid == "inb-1"
+
+
+@pytest.mark.asyncio
+async def test_list_hosts_reads_inbound_uuid_from_flat_field():
+    # uuid инбаунда лежит прямо в host'е, без вложенного inbound.
+    resp = types.SimpleNamespace(hosts=[
+        types.SimpleNamespace(
+            uuid="host-2", remark="DE", address="2.2.2.2", port=8443,
+            inbound_uuid="inb-flat",
+        )
+    ])
+    sdk = _FakeSDK(_FakeNode(), hosts=_FakeHosts(hosts_resp=resp))
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    hosts = await c.list_hosts()
+    assert hosts[0].inbound_uuid == "inb-flat"
+
+
+@pytest.mark.asyncio
+async def test_list_hosts_accepts_bare_list():
+    # Ответ — голый список (без обёртки .hosts); inbound_uuid недоступен → None.
+    resp = [types.SimpleNamespace(
+        uuid="host-3", remark="FR", address="3.3.3.3", port=2053
+    )]
+    sdk = _FakeSDK(_FakeNode(), hosts=_FakeHosts(hosts_resp=resp))
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    hosts = await c.list_hosts()
+    assert len(hosts) == 1
+    assert hosts[0].address == "3.3.3.3"
+    assert hosts[0].inbound_uuid is None
+
+
+@pytest.mark.asyncio
+async def test_list_hosts_missing_method_returns_empty():
+    # У SDK нет get_all_hosts → защитный фолбэк: пустой список. Подменяем hosts
+    # на объект без этого метода (как у более старой/иной версии SDK).
+    sdk = _FakeSDK(_FakeNode())
+    sdk.hosts = types.SimpleNamespace(create_host=None)
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    assert await c.list_hosts() == []
+
+
+@pytest.mark.asyncio
+async def test_list_hosts_exception_returns_empty():
+    # Вызов листинга упал → пустой список, публикация идёт обычным путём.
+    class _Boom(_FakeHosts):
+        async def get_all_hosts(self):
+            raise RuntimeError("панель недоступна")
+
+    sdk = _FakeSDK(_FakeNode(), hosts=_Boom())
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    assert await c.list_hosts() == []
+
+
+@pytest.mark.asyncio
 async def test_list_internal_squads():
     c = _client(_FakeNode())
     squads = await c.list_internal_squads()
@@ -223,12 +310,14 @@ async def test_add_inbounds_to_squads_merges_without_dups(monkeypatch):
     sdk = _FakeSDK(_FakeNode())
     c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
 
-    # inb-x уже есть в sq-1 — не должен задвоиться; sq-2 пустой.
+    # Дедуп per-squad (ADR 0008): в каждый сквад дописываем оба инбаунда,
+    # отбрасывая дубли против ТЕКУЩЕГО состава этого сквада. В sq-1 уже есть
+    # inb-x — он не задваивается; sq-2 пустой, поэтому получает оба целиком.
     await c.add_inbounds_to_squads(["sq-1", "sq-2"], ["inb-x", "inb-new"])
 
     assert sdk.internal_squads.updated == [
         ("sq-1", ["inb-x", "inb-new"]),
-        ("sq-2", ["inb-new"]),
+        ("sq-2", ["inb-x", "inb-new"]),
     ]
 
 

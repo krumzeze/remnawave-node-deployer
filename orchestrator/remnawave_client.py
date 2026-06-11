@@ -88,6 +88,21 @@ class CreatedHost:
     port: int
 
 
+@dataclass
+class HostRef:
+    """Срез существующего хоста панели для дедупликации при повторном провижене.
+
+    inbound_uuid может быть недоступен в ответе SDK (форма не зафиксирована),
+    поэтому он опционален; надёжный минимум для сравнения — address + port.
+    """
+
+    uuid: str
+    remark: str
+    address: str
+    port: int | None
+    inbound_uuid: str | None
+
+
 def _derive_status(node) -> NodeConnState:
     """Свести флаги ответа панели к одному состоянию.
 
@@ -101,6 +116,26 @@ def _derive_status(node) -> NodeConnState:
     if getattr(node, "is_connecting", False):
         return NodeConnState.CONNECTING
     return NodeConnState.OFFLINE
+
+
+def _host_inbound_uuid(host) -> str | None:
+    """Достать uuid инбаунда из элемента листинга хостов.
+
+    Форма ответа SDK не зафиксирована: uuid инбаунда встречается то прямо в
+    host'е (inbound_uuid/config_profile_inbound_uuid), то во вложенном объекте
+    inbound. Пробуем по очереди, при отсутствии — None (тогда сверка идёт только
+    по address+port)."""
+    for attr in ("inbound_uuid", "config_profile_inbound_uuid"):
+        val = getattr(host, attr, None)
+        if val:
+            return str(val)
+    inbound = getattr(host, "inbound", None)
+    if inbound is not None:
+        for attr in ("config_profile_inbound_uuid", "uuid"):
+            val = getattr(inbound, attr, None)
+            if val:
+                return str(val)
+    return None
 
 
 def _to_info(node) -> NodeInfo:
@@ -371,6 +406,39 @@ class RemnawaveClient:
         """Состояние ноды по uuid; поллим до NodeConnState.ONLINE."""
         node = await self._sdk.nodes.get_one_node(uuid=str(uuid))
         return _derive_status(node)
+
+    async def list_hosts(self) -> list[HostRef]:
+        """Существующие хосты панели для дедупликации при повторном провижене.
+
+        Нужно, чтобы повторный запуск той же ноды не плодил дубли хостов: перед
+        созданием хоста вызывающий код сверяется с этим списком. Защитно, как и
+        _find_node_by_address: нет метода у SDK или вызов упал/отдал неожиданную
+        форму — возвращаем пустой список, и публикация идёт обычным путём
+        (создаём всё; хуже дубль, чем падение всего провижина).
+
+        Форма ответа SDK 2.7.x не зафиксирована, поэтому поля и привязку к
+        инбаунду тянем через getattr с фолбэками; uuid инбаунда у разных версий
+        лежит то в самом host'е, то во вложенном объекте inbound."""
+        getter = getattr(self._sdk.hosts, "get_all_hosts", None)
+        if getter is None:
+            return []
+        try:
+            resp = await getter()
+        except Exception:  # noqa: BLE001 — недоступность листинга не ломает публикацию
+            return []
+        items = getattr(resp, "hosts", None)
+        if items is None:
+            items = resp if isinstance(resp, list) else []
+        return [
+            HostRef(
+                uuid=str(getattr(h, "uuid", "")),
+                remark=getattr(h, "remark", "") or "",
+                address=getattr(h, "address", "") or "",
+                port=getattr(h, "port", None),
+                inbound_uuid=_host_inbound_uuid(h),
+            )
+            for h in items
+        ]
 
     async def create_host(
         self,
