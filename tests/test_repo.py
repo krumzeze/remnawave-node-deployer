@@ -103,3 +103,39 @@ async def test_record_status_missing_node_is_noop(sm):
     async with sm() as session:
         tasks = (await session.scalars(select(TaskRow))).all()
         assert tasks == []
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_for_owner_only_owner_newest_first(sm):
+    p1 = await repo.get_or_create_panel(sm, owner_tg_id=1, url="https://a", token_vault_path="t")
+    p2 = await repo.get_or_create_panel(sm, owner_tg_id=2, url="https://b", token_vault_path="t")
+    n1 = await repo.create_node_record(sm, panel_id=p1, ip="1.1.1.1")
+    n2 = await repo.create_node_record(sm, panel_id=p1, ip="2.2.2.2")
+    await repo.create_node_record(sm, panel_id=p2, ip="9.9.9.9")  # чужая
+    nodes = await repo.list_nodes_for_owner(sm, owner_tg_id=1)
+    ids = [n.id for n in nodes]
+    assert set(ids) == {n1, n2}
+    assert ids[0] == n2  # свежая сверху
+
+
+@pytest.mark.asyncio
+async def test_get_node_for_owner_checks_ownership(sm):
+    p1 = await repo.get_or_create_panel(sm, owner_tg_id=1, url="https://a", token_vault_path="t")
+    node_id = await repo.create_node_record(sm, panel_id=p1, ip="1.1.1.1")
+    assert (await repo.get_node_for_owner(sm, node_id, 1)).ip == "1.1.1.1"
+    assert await repo.get_node_for_owner(sm, node_id, 2) is None      # чужой
+    assert await repo.get_node_for_owner(sm, 999, 1) is None          # нет такой
+
+
+@pytest.mark.asyncio
+async def test_delete_node_removes_node_and_history(sm):
+    p1 = await repo.get_or_create_panel(sm, owner_tg_id=1, url="https://a", token_vault_path="t")
+    node_id = await repo.create_node_record(sm, panel_id=p1, ip="1.1.1.1")
+    await repo.record_status(sm, node_id, "online", "ok")
+    assert await repo.delete_node(sm, node_id, 2) is False            # чужую нельзя
+    assert await repo.delete_node(sm, node_id, 1) is True
+    assert await repo.get_node_for_owner(sm, node_id, 1) is None
+    async with sm() as session:
+        tasks = (await session.scalars(select(TaskRow).where(TaskRow.node_id == node_id))).all()
+        assert tasks == []
+    assert await repo.delete_node(sm, node_id, 1) is False            # повторно — нечего

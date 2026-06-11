@@ -3,14 +3,20 @@ services:
     build: .
     command: python -m bot
     env_file: .env
-    depends_on: [postgres, redis, vault]
+    depends_on:
+      postgres: {condition: service_started}
+      redis: {condition: service_started}
+      vault: {condition: service_healthy}
     restart: unless-stopped
 
   worker:
     build: .
     command: arq orchestrator.tasks.WorkerSettings
     env_file: .env
-    depends_on: [postgres, redis, vault]
+    depends_on:
+      postgres: {condition: service_started}
+      redis: {condition: service_started}
+      vault: {condition: service_healthy}
     restart: unless-stopped
 
   web:
@@ -33,17 +39,33 @@ services:
 
   redis:
     image: redis:7-alpine
+    # appendonly + том: очередь arq и FSM-состояние мастера переживают рестарт.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redisdata:/data"]
     restart: unless-stopped
 
-  # Dev-режим Vault. Для прод — отдельный развёрнутый Vault с unseal/политиками.
+  # Боевой Vault с файловым хранилищем и авто-распечаткой (см. vault/entrypoint.sh
+  # и vault/config/vault.hcl). В отличие от прежнего dev-режима секреты лежат в
+  # томе и переживают рестарт — из-за этого бот больше не «забывает» панель.
   vault:
     image: hashicorp/vault:1.16
-    cap_add: ["IPC_LOCK"]
+    env_file: .env
     environment:
-      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN}
-      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
+    entrypoint: ["/bin/sh", "/vault/entrypoint.sh"]
+    volumes:
+      - vaultdata:/vault/file
+      - ./vault/config:/vault/config:ro
+      - ./vault/entrypoint.sh:/vault/entrypoint.sh:ro
     ports: ["8200:8200"]
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     restart: unless-stopped
 
 volumes:
   pgdata:
+  redisdata:
+  vaultdata:

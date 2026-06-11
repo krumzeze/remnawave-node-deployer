@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from db.models import Node, Panel
+from db.models import AuditLog, Node, Panel
 from db.models import Task as TaskRow
 
 log = logging.getLogger(__name__)
@@ -140,3 +140,49 @@ async def record_status(
         node.state = state
         session.add(TaskRow(node_id=node_id, state=state, detail=detail[:_DETAIL_MAX]))
         await session.commit()
+
+
+async def list_nodes_for_owner(
+    session_factory: async_sessionmaker, owner_tg_id: int
+) -> list[Node]:
+    """Все ноды владельца (через его панели), свежие сверху."""
+    async with session_factory() as session:
+        rows = await session.scalars(
+            select(Node)
+            .join(Panel, Node.panel_id == Panel.id)
+            .where(Panel.owner_tg_id == owner_tg_id)
+            .order_by(Node.created_at.desc(), Node.id.desc())
+        )
+        return list(rows.all())
+
+
+async def get_node_for_owner(
+    session_factory: async_sessionmaker, node_id: int, owner_tg_id: int
+) -> Node | None:
+    """Нода по id с проверкой владельца, иначе None."""
+    async with session_factory() as session:
+        node = await session.get(Node, node_id)
+        if node is None:
+            return None
+        panel = await session.get(Panel, node.panel_id)
+        if panel is None or panel.owner_tg_id != owner_tg_id:
+            return None
+        return node
+
+
+async def delete_node(
+    session_factory: async_sessionmaker, node_id: int, owner_tg_id: int
+) -> bool:
+    """Убрать ноду из БД деплойера вместе с её историей (Task/AuditLog)."""
+    async with session_factory() as session:
+        node = await session.get(Node, node_id)
+        if node is None:
+            return False
+        panel = await session.get(Panel, node.panel_id)
+        if panel is None or panel.owner_tg_id != owner_tg_id:
+            return False
+        await session.execute(delete(TaskRow).where(TaskRow.node_id == node_id))
+        await session.execute(delete(AuditLog).where(AuditLog.node_id == node_id))
+        await session.delete(node)
+        await session.commit()
+        return True
