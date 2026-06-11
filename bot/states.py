@@ -20,6 +20,15 @@ class AddNode(StatesGroup):
     wait_panel_url = State()
     wait_panel_token = State()
 
+    # Разворот панели с нуля (режим «new», ADR 0001): размещение (vps|local),
+    # домен панели, логин и пароль супер-админа. Пароль панель валидирует по
+    # сложности (>=24, заглавная+строчная+цифра) — мастер проверяет до запуска и
+    # просит заново при ошибке. Для vps дальше идут общие шаги доступа к серверу.
+    choose_placement = State()
+    wait_panel_domain = State()
+    wait_admin_username = State()
+    wait_admin_password = State()
+
     # Данные сервера
     wait_ip = State()
     wait_login = State()       # логин нужен обеим веткам доступа

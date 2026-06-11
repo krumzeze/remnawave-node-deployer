@@ -34,5 +34,5 @@ class WizCB(CallbackData, prefix="w"):
     all/done/skip/default. Длинные значения (uuid сквадов, значения inbound'ов)
     в callback не кладём — храним выбор в FSM, в кнопке только индекс/номер.
     """
-    action: str  # pm | auth | keyok | inb | donor | cc | sq | go | cancel
+    action: str  # pm | plc | auth | keyok | inb | donor | cc | sq | go | cancel
     val: str = ""

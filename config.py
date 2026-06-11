@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     remnawave_panel_url: str = ""
     remnawave_api_token: str = ""
 
+    # Каталог на хосте деплойера, куда пишутся файлы стека панели при локальном
+    # разворачивании (вариант «local», ADR 0001). docker compose там же и
+    # запускается через смонтированный docker-сокет хоста. Для варианта «vps»
+    # не используется. Пустая строка = фолбэк на дефолт ниже.
+    panel_local_dir: str = "/opt/remnawave-panel"
+
     web_host: str = "0.0.0.0"
     web_port: int = 8000
 

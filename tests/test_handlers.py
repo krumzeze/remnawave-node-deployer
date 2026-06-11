@@ -288,3 +288,91 @@ def test_build_payload_omits_squads_when_absent():
         panel_token_vault_path="panels/7/token",
     )
     assert "squad_uuids" not in payload
+
+
+# --------------------------------------------------------------------------
+# Разворот панели с нуля (режим «new», ADR 0001): валидатор пароля админа и
+# сборка payload панели. Чистые функции — без сети и FSM.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "password",
+    [
+        "Abcdefghijklmnopqrstuv1Z",      # ровно 24, есть все классы
+        "MyStrongPanelPassword2026!!",   # длиннее, со спецсимволами
+    ],
+)
+def test_validate_admin_password_ok(password):
+    assert handlers.validate_admin_password(password) is None
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "",                              # пусто
+        "Short1A",                       # короче 24
+        "abcdefghijklmnopqrstuvw1",      # нет заглавной
+        "ABCDEFGHIJKLMNOPQRSTUVW1",      # нет строчной
+        "Abcdefghijklmnopqrstuvwz",      # нет цифры
+    ],
+)
+def test_validate_admin_password_rejects(password):
+    # Возвращается понятный текст ошибки, а не None.
+    msg = handlers.validate_admin_password(password)
+    assert isinstance(msg, str) and msg
+
+
+def test_build_panel_payload_vps_omits_raw_secrets():
+    data = {
+        "panel_mode": "new",
+        "placement": "vps",
+        "panel_domain": "panel.example",
+        "admin_username": "admin",
+        "admin_password": "MyStrongPanelPassword2026",
+        "ip": "1.2.3.4",
+        "login": "root",
+        "auth": "password",
+        "password": "server-pw",
+    }
+    payload = handlers.build_panel_payload(
+        data, owner=7, chat_id=42,
+        admin_secret_vault_path="transient/panels/7/admin",
+        secret_vault_path="transient/panels/7/bootstrap",
+    )
+
+    assert payload["owner"] == 7
+    assert payload["chat_id"] == 42
+    assert payload["placement"] == "vps"
+    assert payload["panel_domain"] == "panel.example"
+    assert payload["admin_username"] == "admin"
+    # Сырых секретов в payload нет — только пути в Vault.
+    assert "admin_password" not in payload
+    assert "password" not in payload
+    assert "private_key" not in payload
+    assert payload["admin_secret_vault_path"] == "transient/panels/7/admin"
+    assert payload["secret_vault_path"] == "transient/panels/7/bootstrap"
+    # Для vps есть доступ к серверу.
+    assert payload["ip"] == "1.2.3.4"
+    assert payload["auth"] == "password"
+
+
+def test_build_panel_payload_local_has_no_server_access():
+    data = {
+        "panel_mode": "new",
+        "placement": "local",
+        "panel_domain": "panel.example",
+        "admin_username": "admin",
+        "admin_password": "MyStrongPanelPassword2026",
+    }
+    payload = handlers.build_panel_payload(
+        data, owner=7, chat_id=42,
+        admin_secret_vault_path="transient/panels/7/admin",
+    )
+
+    assert payload["placement"] == "local"
+    # Локально сервера нет — ip/login/auth/secret_vault_path не кладём.
+    assert "ip" not in payload
+    assert "login" not in payload
+    assert "auth" not in payload
+    assert "secret_vault_path" not in payload
+    assert "admin_password" not in payload
+    assert payload["admin_secret_vault_path"] == "transient/panels/7/admin"

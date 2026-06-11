@@ -25,6 +25,7 @@ HARDENING_PLAYBOOK = PLAYBOOKS_DIR / "hardening.yml"
 DEPLOY_NODE_PLAYBOOK = PLAYBOOKS_DIR / "deploy_node.yml"
 ISSUE_CERT_PLAYBOOK = PLAYBOOKS_DIR / "issue_cert.yml"   # TLS-инбаунды, ADR 0005
 OPEN_PORTS_PLAYBOOK = PLAYBOOKS_DIR / "open_ports.yml"   # порты inbound'ов в UFW
+DEPLOY_PANEL_PLAYBOOK = PLAYBOOKS_DIR / "deploy_panel.yml"   # разворот панели на VPS
 
 # Имя хоста в инвентаре. Один сервер на запуск — больше для ноды не нужно.
 INVENTORY_HOST = "node"

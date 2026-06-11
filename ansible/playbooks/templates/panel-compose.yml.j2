@@ -1,0 +1,60 @@
+# Стек панели Remnawave: backend + postgres + redis + caddy.
+# Рендерится deploy_panel.yml; секреты — в panel.env (env_file), наружу торчит
+# только Caddy (80/443), бэкенд слушает 127.0.0.1:3000 внутри сети стека.
+services:
+  remnawave:
+    image: remnawave/backend:latest
+    container_name: remnawave
+    hostname: remnawave
+    restart: always
+    env_file:
+      - panel.env
+    depends_on:
+      remnawave-db:
+        condition: service_healthy
+      remnawave-redis:
+        condition: service_started
+
+  remnawave-db:
+    image: postgres:17-alpine
+    container_name: remnawave-db
+    hostname: remnawave-db
+    restart: always
+    env_file:
+      - panel.env
+    volumes:
+      - panel-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U remnawave -d remnawave"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  remnawave-redis:
+    image: redis:7-alpine
+    container_name: remnawave-redis
+    hostname: remnawave-redis
+    restart: always
+    volumes:
+      - panel-redis:/data
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: remnawave-caddy
+    hostname: remnawave-caddy
+    restart: always
+    depends_on:
+      - remnawave
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - panel-caddy-data:/data
+      - panel-caddy-config:/config
+
+volumes:
+  panel-db:
+  panel-redis:
+  panel-caddy-data:
+  panel-caddy-config:

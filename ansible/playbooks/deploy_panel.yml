@@ -1,0 +1,131 @@
+---
+# Разворот стека панели Remnawave на отдельном VPS (вариант «vps», ADR 0001).
+# Ставит Docker (как deploy_node.yml), рендерит стек панели с Caddy и auto-TLS,
+# открывает 80/443 в UFW и ждёт ответа бэкенда. Секреты (JWT, пароль БД) и домен
+# приходят из оркестратора через extra-vars, в самом плейбуке их нет.
+- name: Deploy Remnawave panel stack
+  hosts: all
+  become: true
+  vars:
+    panel_dir: /opt/remnawave-panel
+    panel_domain: ""               # передаётся из оркестратора
+    panel_jwt_auth_secret: ""
+    panel_jwt_api_tokens_secret: ""
+    panel_metrics_pass: ""
+    panel_postgres_password: ""
+    # ansible_architecture → имя архитектуры в apt-репозитории Docker.
+    docker_arch_map:
+      x86_64: amd64
+      aarch64: arm64
+  tasks:
+    # Docker ставим из официального apt-репозитория (та же логика и причины, что
+    # в deploy_node.yml: convenience-скрипт не доставит compose-плагин на образах
+    # с предустановленным docker.io, apt-установка идемпотентна и плагин ставит).
+    - name: Install Docker apt prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Create apt keyrings dir
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ docker_arch_map[ansible_architecture] | default(ansible_architecture) }}
+          signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+
+    - name: Install Docker Engine and Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker service is running and enabled
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    # Caddy сам выпускает сертификат по ACME (HTTP-01 на 80, ALPN на 443) и
+    # держит панель на 443. hardening оставил default deny + только 22 — без
+    # этих правил ни ACME, ни вход в панель не пройдут.
+    - name: Allow HTTP in UFW (ACME challenge)
+      community.general.ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: Allow HTTPS in UFW (panel)
+      community.general.ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+
+    - name: Create panel dir
+      ansible.builtin.file:
+        path: "{{ panel_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Render panel docker-compose
+      ansible.builtin.template:
+        src: panel-compose.yml.j2
+        dest: "{{ panel_dir }}/docker-compose.yml"
+        mode: "0640"
+
+    - name: Render Caddyfile
+      ansible.builtin.template:
+        src: Caddyfile.j2
+        dest: "{{ panel_dir }}/Caddyfile"
+        mode: "0640"
+
+    # env с секретами (JWT, пароль БД) — права 600, владелец root.
+    - name: Render panel env
+      ansible.builtin.template:
+        src: panel.env.j2
+        dest: "{{ panel_dir }}/panel.env"
+        mode: "0600"
+
+    - name: Up panel stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ panel_dir }}"
+        env_files:
+          - "{{ panel_dir }}/panel.env"
+        state: present
+
+    # Бэкенд биндится на 127.0.0.1:3000 внутри стека; ждём, пока он начнёт
+    # отвечать на /api/auth/status через локальный порт, прежде чем отдать
+    # управление оркестратору (тот ещё раз дождётся панели через Caddy/домен).
+    - name: Wait for panel backend to answer
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:3000/api/auth/status"
+        status_code: 200
+        headers:
+          x-forwarded-proto: https
+          x-forwarded-for: 127.0.0.1
+      register: panel_health
+      retries: 60
+      delay: 5
+      until: panel_health.status == 200

@@ -18,6 +18,12 @@ services:
       redis: {condition: service_started}
       vault: {condition: service_healthy}
     restart: unless-stopped
+    # Локальный разворот панели (placement=local, ADR 0001) гоняет docker compose
+    # на самом хосте, поэтому воркеру нужен доступ к docker-демону хоста. Для
+    # обычной работы (ноды, vps-панель) это не требуется — оставлено выключенным.
+    # Включай, только если будешь разворачивать панель на хосте деплойера.
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock
 
   web:
     build: .

@@ -105,6 +105,17 @@ def panel_mode() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def placement_choice() -> InlineKeyboardMarkup:
+    """Где развернуть панель с нуля (ADR 0001): на отдельном VPS (как ноды,
+    через SSH) или на хосте деплойера (docker compose локально)."""
+    b = InlineKeyboardBuilder()
+    b.button(text="🌐 На отдельном VPS", callback_data=WizCB(action="plc", val="vps"))
+    b.button(text="🏠 На этом сервере", callback_data=WizCB(action="plc", val="local"))
+    _cancel_button(b)
+    b.adjust(1)
+    return b.as_markup()
+
+
 def login_default() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="👤 root (по умолчанию)", callback_data=WizCB(action="login", val="root"))

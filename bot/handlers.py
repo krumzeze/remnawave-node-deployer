@@ -224,6 +224,80 @@ def build_payload(
     return payload
 
 
+# Требования панели к паролю супер-админа (см. контракт 2.7.x): длина >= 24,
+# минимум одна заглавная, одна строчная, одна цифра. Валидируем в мастере, чтобы
+# не гонять заведомо отклонённый пароль до самой регистрации.
+ADMIN_PASSWORD_MIN_LEN = 24
+
+
+def validate_admin_password(password: str) -> str | None:
+    """Проверить пароль супер-админа панели на сложность.
+
+    Возвращает None, если пароль годится, иначе — текст ошибки для оператора
+    (понятный, без раскрытия самого пароля). Требования диктует панель: длина
+    не меньше 24, минимум одна заглавная, одна строчная и одна цифра."""
+    pwd = password or ""
+    if len(pwd) < ADMIN_PASSWORD_MIN_LEN:
+        return f"Пароль должен быть не короче {ADMIN_PASSWORD_MIN_LEN} символов."
+    if not any(c.islower() for c in pwd):
+        return "В пароле нужна хотя бы одна строчная буква."
+    if not any(c.isupper() for c in pwd):
+        return "В пароле нужна хотя бы одна заглавная буква."
+    if not any(c.isdigit() for c in pwd):
+        return "В пароле нужна хотя бы одна цифра."
+    return None
+
+
+def build_panel_payload(
+    data: dict, *, owner: int, chat_id: int,
+    admin_secret_vault_path: str, secret_vault_path: str | None = None,
+) -> dict:
+    """Собрать payload задачи provision_panel из данных мастера (режим «new»).
+
+    Секреты в payload не кладём — он лежит в Redis открытым текстом до выборки
+    воркером. Пароль админа и (для vps) доступ-секрет bootstrap пишутся в Vault
+    на транзитные пути, в payload идут только пути: admin_secret_vault_path и
+    secret_vault_path. Для размещения «local» серверного доступа нет, поэтому
+    ip/login/auth/secret_vault_path не добавляем.
+    """
+    placement = data.get("placement", "vps")
+    payload: dict = {
+        "owner": owner,
+        "chat_id": chat_id,
+        "placement": placement,
+        "panel_domain": data["panel_domain"],
+        "admin_username": data["admin_username"],
+        "admin_secret_vault_path": admin_secret_vault_path,
+    }
+    if placement == "vps":
+        payload["ip"] = data["ip"]
+        payload["login"] = data.get("login", "root")
+        payload["auth"] = data["auth"]
+        payload["secret_vault_path"] = secret_vault_path
+    return payload
+
+
+def _panel_confirm_summary(data: dict) -> str:
+    """Сводка перед запуском разворота панели: что именно уйдёт воркеру."""
+    placement = data.get("placement", "vps")
+    where = "отдельный VPS" if placement == "vps" else "этот сервер"
+    lines = [
+        "Проверь параметры панели:",
+        f"• Размещение: {where}",
+        f"• Домен: {data.get('panel_domain', '—')}",
+        f"• Логин админа: {data.get('admin_username', '—')}",
+        "• Пароль админа: задан (не показывается)",
+    ]
+    if placement == "vps":
+        lines.append(
+            f"• Сервер: {data.get('ip', '—')} (логин {data.get('login', 'root')})"
+        )
+        lines.append(
+            f"• Доступ: {'пароль' if data.get('auth') == 'password' else 'ключ'}"
+        )
+    return "\n".join(lines)
+
+
 def _confirm_summary(data: dict) -> str:
     """Сводка перед запуском: что именно уйдёт воркеру."""
     inbounds = data.get("inbounds")
@@ -532,12 +606,14 @@ async def wiz_cancel(query: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AddNode.choose_panel_mode, WizCB.filter(F.action == "pm"))
 async def wiz_panel_mode(query: CallbackQuery, callback_data: WizCB, state: FSMContext) -> None:
     if callback_data.val == "new":
-        # Разворот панели с нуля — отдельный флоу (ADR 0001), он ещё не готов.
-        await state.clear()
+        # Разворот панели с нуля (ADR 0001): сперва выбираем размещение, дальше
+        # домен/логин/пароль и (для vps) доступ к серверу — см. wiz_placement.
+        await state.update_data(panel_mode="new")
+        await state.set_state(AddNode.choose_placement)
         await _render(
             query,
-            "Разворот панели с нуля пока не реализован. Подключи существующую панель.",
-            keyboards.main_menu(),
+            "Где развернуть панель?",
+            keyboards.placement_choice(),
         )
         await query.answer()
         return
@@ -620,11 +696,21 @@ async def wiz_auth(query: CallbackQuery, callback_data: WizCB, state: FSMContext
 async def wiz_password(message: Message, state: FSMContext) -> None:
     # Пароль не логируем. Держим в FSM только до постановки задачи.
     await state.update_data(password=(message.text or ""))
+    data = await state.get_data()
+    if data.get("panel_mode") == "new":
+        # Разворот панели на vps: доступ к серверу собран, inbound'ы тут не нужны.
+        await _go_panel_confirm_step(message, state)
+        return
     await _show_inbounds(message, state)
 
 
 @router.callback_query(AddNode.wait_key_added, WizCB.filter(F.action == "keyok"))
 async def wiz_key_added(query: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data.get("panel_mode") == "new":
+        await _go_panel_confirm_step(query, state)
+        await query.answer()
+        return
     await _show_inbounds(query, state)
     await query.answer()
 
@@ -828,6 +914,11 @@ async def _go_confirm_step(event, state: FSMContext) -> None:
 @router.callback_query(AddNode.confirm, WizCB.filter(F.action == "go"))
 async def wiz_confirm(query: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
+    # Один шаг подтверждения на оба сценария: добавление ноды и разворот панели.
+    # Разводим по panel_mode, чтобы не плодить два фильтра на одном состоянии.
+    if data.get("panel_mode") == "new":
+        await _confirm_panel(query, state, data)
+        return
     from db import get_sessionmaker
     from db.repo import create_node_record, get_or_create_panel
 
@@ -867,6 +958,137 @@ async def wiz_confirm(query: CallbackQuery, state: FSMContext) -> None:
     await _render(
         query,
         "Задача поставлена. Статусы установки буду присылать сюда.",
+        keyboards.to_menu(),
+    )
+    await query.answer("Запущено")
+
+
+# --------------------------------------------------------------------------
+# Мастер разворота панели с нуля (режим «new», ADR 0001).
+# --------------------------------------------------------------------------
+@router.callback_query(AddNode.choose_placement, WizCB.filter(F.action == "plc"))
+async def wiz_placement(query: CallbackQuery, callback_data: WizCB, state: FSMContext) -> None:
+    placement = callback_data.val if callback_data.val in ("vps", "local") else "vps"
+    await state.update_data(placement=placement)
+    await state.set_state(AddNode.wait_panel_domain)
+    await _render(
+        query,
+        "Домен для панели (например panel.example.com). На него Caddy выпустит "
+        "сертификат — заранее создай A-запись на сервер панели.",
+        keyboards.cancel_only(),
+    )
+    await query.answer()
+
+
+@router.message(AddNode.wait_panel_domain)
+async def wiz_panel_domain(message: Message, state: FSMContext) -> None:
+    domain_name = domain.normalize_domain(message.text or "")
+    if not domain.is_valid_domain(domain_name):
+        await message.answer(
+            "Не похоже на домен. Например panel.example.com.",
+            reply_markup=keyboards.cancel_only(),
+        )
+        return
+    await state.update_data(panel_domain=domain_name)
+    await state.set_state(AddNode.wait_admin_username)
+    await message.answer(
+        "Логин супер-админа панели (его будешь вводить при входе):",
+        reply_markup=keyboards.cancel_only(),
+    )
+
+
+@router.message(AddNode.wait_admin_username)
+async def wiz_admin_username(message: Message, state: FSMContext) -> None:
+    username = (message.text or "").strip()
+    if not username:
+        await message.answer(
+            "Логин не может быть пустым. Пришли логин супер-админа.",
+            reply_markup=keyboards.cancel_only(),
+        )
+        return
+    await state.update_data(admin_username=username)
+    await state.set_state(AddNode.wait_admin_password)
+    await message.answer(
+        "Пароль супер-админа. Требования панели: не короче 24 символов, "
+        "минимум одна заглавная, одна строчная буква и одна цифра.",
+        reply_markup=keyboards.cancel_only(),
+    )
+
+
+@router.message(AddNode.wait_admin_password)
+async def wiz_admin_password(message: Message, state: FSMContext) -> None:
+    # Пароль не логируем. Держим в FSM только до постановки задачи (как пароль
+    # доступа к серверу). Сначала проверяем сложность — панель отклонит слабый.
+    password = message.text or ""
+    error = validate_admin_password(password)
+    if error is not None:
+        await message.answer(
+            f"{error} Пришли пароль ещё раз.",
+            reply_markup=keyboards.cancel_only(),
+        )
+        return
+    await state.update_data(admin_password=password)
+    data = await state.get_data()
+    if data.get("placement") == "local":
+        # Локальный разворот: сервер не нужен, сразу к подтверждению.
+        await _go_panel_confirm_step(message, state)
+        return
+    # Разворот на vps: дальше общие шаги доступа к серверу (IP → логин → способ).
+    await state.set_state(AddNode.wait_ip)
+    await message.answer(
+        "Теперь сервер панели. Пришли IP сервера:",
+        reply_markup=keyboards.cancel_only(),
+    )
+
+
+async def _go_panel_confirm_step(event, state: FSMContext) -> None:
+    await state.set_state(AddNode.confirm)
+    data = await state.get_data()
+    await _render(event, _panel_confirm_summary(data), keyboards.confirm_kb())
+
+
+async def _confirm_panel(query: CallbackQuery, state: FSMContext, data: dict) -> None:
+    """Запуск разворота панели: транзитные секреты в Vault, задача в очередь.
+
+    Пароль админа (и для vps — доступ-секрет bootstrap) пишем в Vault на
+    транзитные пути и отдаём воркеру только пути; в payload очереди секретов нет.
+    Panel в БД здесь не создаём — её запишет воркер после успешного разворота
+    (build_panel_deps), когда появится рабочий URL и токен.
+    """
+    from secretstore.vault import VaultStore
+
+    owner = _owner_of(query)
+    chat_id = query.message.chat.id
+    placement = data.get("placement", "vps")
+
+    vault = VaultStore()
+    admin_secret_path = f"transient/panels/{owner}/admin"
+    vault.put(admin_secret_path, {"password": data.get("admin_password", "")})
+
+    secret_path = None
+    if placement == "vps":
+        secret_path = f"transient/panels/{owner}/bootstrap"
+        if data.get("auth") == "password":
+            bootstrap_secret = {"auth": "password", "password": data.get("password", "")}
+        else:
+            bootstrap_secret = {"auth": "key", "private_key": data.get("private_key", "")}
+        vault.put(secret_path, bootstrap_secret)
+
+    payload = build_panel_payload(
+        data, owner=owner, chat_id=chat_id,
+        admin_secret_vault_path=admin_secret_path, secret_vault_path=secret_path,
+    )
+    queue = await _get_queue()
+    await queue.enqueue_job("provision_panel", payload)
+
+    logger.info(
+        "enqueue provision_panel owner=%s placement=%s domain=%s",
+        owner, placement, data.get("panel_domain"),
+    )
+    await state.clear()
+    await _render(
+        query,
+        "Задача поставлена. Статусы разворота панели буду присылать сюда.",
         keyboards.to_menu(),
     )
     await query.answer("Запущено")

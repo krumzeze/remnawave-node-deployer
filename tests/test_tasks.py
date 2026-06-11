@@ -811,3 +811,211 @@ async def test_tls_open_ports_excludes_80():
     assert "issue_cert.yml" in names
     assert open_ports == [443]
     assert 80 not in open_ports
+
+
+# ==========================================================================
+# Разворот панели с нуля (provision_panel, ADR 0001) — на фейках.
+# ==========================================================================
+class _FakeVault:
+    """Фейковый Vault для разворота панели: хранит секреты в памяти.
+
+    Транзитный пароль админа кладётся ботом; провижн читает его, выдаёт токен и
+    стирает транзит. Боевой токен и Panel пишет persist_panel (шов deps)."""
+
+    def __init__(self):
+        self.store: dict[str, dict] = {}
+        self.deleted: list[str] = []
+
+    def get(self, path):
+        if path not in self.store:
+            raise KeyError(path)
+        return self.store[path]
+
+    def put(self, path, data):
+        self.store[path] = dict(data)
+
+    def delete(self, path):
+        self.deleted.append(path)
+        self.store.pop(path, None)
+
+
+class _FakeLocalCompose:
+    """Фейковый локальный compose: фиксирует записанные файлы и факт запуска."""
+
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        self.written = None
+        self.upped = False
+
+    def write_stack(self, compose, caddyfile, env):
+        self.written = {"compose": compose, "caddyfile": caddyfile, "env": env}
+        return self.base_dir
+
+    def up(self, cwd):
+        self.upped = True
+
+
+def _panel_deps(*, vault, reports, run_playbook=None, provision_admin=None,
+                make_local_compose=None, persist_panel=None):
+    """Собрать ProvisionDeps для разворота панели со счастливыми дефолтами."""
+    async def report(state, detail):
+        reports.append((state, detail))
+
+    async def bootstrap_password(ip, login, password):
+        return BootstrapResult(ok=True, private_key="PRIVKEY")
+
+    async def bootstrap_key(ip, login, private_key):
+        return BootstrapResult(ok=True, private_key=private_key)
+
+    async def default_run_playbook(playbook, host, login, private_key, **kw):
+        return ansible_runner.PlaybookResult(ok=True)
+
+    async def default_provision_admin(panel_url, username, password, **kw):
+        return "PANEL-API-TOKEN"
+
+    async def sleep(_):
+        return None
+
+    return tasks.ProvisionDeps(
+        bootstrap_password=bootstrap_password,
+        bootstrap_key=bootstrap_key,
+        run_playbook=run_playbook or default_run_playbook,
+        provision_panel_admin=provision_admin or default_provision_admin,
+        make_local_compose=make_local_compose or _FakeLocalCompose,
+        report=report,
+        sleep=sleep,
+        vault_get=vault.get,
+        vault_put=vault.put,
+        vault_delete=vault.delete,
+        persist_panel=persist_panel,
+    )
+
+
+def _panel_payload(**over):
+    p = {
+        "owner": 7,
+        "chat_id": 100,
+        "placement": "vps",
+        "panel_domain": "panel.example",
+        "admin_username": "admin",
+        "admin_secret_vault_path": "transient/panels/7/admin",
+        "ip": "1.2.3.4",
+        "login": "root",
+        "auth": "password",
+        "secret_vault_path": "transient/panels/7/bootstrap",
+    }
+    p.update(over)
+    return p
+
+
+@pytest.mark.asyncio
+async def test_provision_panel_vps_happy_path():
+    vault = _FakeVault()
+    vault.put("transient/panels/7/admin", {"password": "S3cret" + "x" * 20})
+    vault.put("transient/panels/7/bootstrap", {"auth": "password", "password": "pw"})
+    reports = []
+    saved = {}
+    played = []
+
+    async def run_playbook(playbook, host, login, private_key, **kw):
+        played.append(str(playbook))
+        return ansible_runner.PlaybookResult(ok=True)
+
+    admin_seen = {}
+
+    async def provision_admin(panel_url, username, password, **kw):
+        admin_seen.update(url=panel_url, username=username, password=password)
+        return "PANEL-API-TOKEN"
+
+    async def persist_panel(*, url, token):
+        saved.update(url=url, token=token)
+
+    deps = _panel_deps(
+        vault=vault, reports=reports, run_playbook=run_playbook,
+        provision_admin=provision_admin, persist_panel=persist_panel,
+    )
+
+    await tasks.provision_panel({"deps": deps}, _panel_payload())
+
+    # Регистрация шла на https://<домен> (Caddy выпускает TLS).
+    assert admin_seen["url"] == "https://panel.example"
+    assert admin_seen["username"] == "admin"
+    # Пароль админа прочитан из Vault, а не из payload.
+    assert admin_seen["password"].startswith("S3cret")
+    # Прогоняли hardening и deploy_panel.
+    assert any("hardening" in p for p in played)
+    assert any("deploy_panel" in p for p in played)
+    # Токен и URL сохранены через persist_panel.
+    assert saved == {"url": "https://panel.example", "token": "PANEL-API-TOKEN"}
+    # Транзитные секреты (пароль админа и доступ-секрет) стёрты.
+    assert "transient/panels/7/admin" in vault.deleted
+    assert "transient/panels/7/bootstrap" in vault.deleted
+    # До FAILED не дошли.
+    assert NodeState.FAILED not in [s for s, _ in reports]
+
+
+@pytest.mark.asyncio
+async def test_provision_panel_local_happy_path():
+    vault = _FakeVault()
+    vault.put("transient/panels/7/admin", {"password": "S3cret" + "x" * 20})
+    reports = []
+    saved = {}
+    made = {}
+
+    def make_local_compose(base_dir):
+        stack = _FakeLocalCompose(base_dir)
+        made["stack"] = stack
+        return stack
+
+    async def persist_panel(*, url, token):
+        saved.update(url=url, token=token)
+
+    deps = _panel_deps(
+        vault=vault, reports=reports,
+        make_local_compose=make_local_compose, persist_panel=persist_panel,
+    )
+
+    # local: ни ip/login/auth, ни secret_vault_path в payload.
+    payload = {
+        "owner": 7,
+        "chat_id": 100,
+        "placement": "local",
+        "panel_domain": "panel.example",
+        "admin_username": "admin",
+        "admin_secret_vault_path": "transient/panels/7/admin",
+    }
+    await tasks.provision_panel({"deps": deps}, payload)
+
+    # Локальный стек собран и поднят, файлы записаны.
+    stack = made["stack"]
+    assert stack.upped is True
+    assert "remnawave" in stack.written["compose"]
+    assert "panel.example" in stack.written["caddyfile"]
+    assert "FRONT_END_DOMAIN=panel.example" in stack.written["env"]
+    # Токен сохранён, пароль админа стёрт; bootstrap-секрета не было.
+    assert saved == {"url": "https://panel.example", "token": "PANEL-API-TOKEN"}
+    assert "transient/panels/7/admin" in vault.deleted
+    assert NodeState.FAILED not in [s for s, _ in reports]
+
+
+@pytest.mark.asyncio
+async def test_provision_panel_admin_failure_goes_failed():
+    vault = _FakeVault()
+    vault.put("transient/panels/7/admin", {"password": "S3cret" + "x" * 20})
+    reports = []
+
+    async def provision_admin(panel_url, username, password, **kw):
+        from orchestrator.panel_setup import PanelSetupError
+        raise PanelSetupError("панель не поднялась")
+
+    deps = _panel_deps(
+        vault=vault, reports=reports, provision_admin=provision_admin,
+    )
+    payload = {
+        "owner": 7, "chat_id": 100, "placement": "local",
+        "panel_domain": "panel.example", "admin_username": "admin",
+        "admin_secret_vault_path": "transient/panels/7/admin",
+    }
+    await tasks.provision_panel({"deps": deps}, payload)
+
+    assert NodeState.FAILED in [s for s, _ in reports]

@@ -1,0 +1,5 @@
+# Caddy: auto-TLS по домену панели, reverse_proxy на бэкенд. Сертификат Caddy
+# выпускает и продлевает сам (нужны открытые 80/443 и A-запись на этот хост).
+{{ panel_domain }} {
+    reverse_proxy remnawave:3000
+}

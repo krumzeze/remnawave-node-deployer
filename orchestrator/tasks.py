@@ -20,7 +20,16 @@ from typing import Any, Awaitable, Callable
 from arq.connections import RedisSettings
 
 from config import settings
-from orchestrator import ansible_runner, domain, reporting, ssh_bootstrap, xray_config
+from orchestrator import (
+    ansible_runner,
+    domain,
+    local_compose,
+    panel_setup,
+    panel_stack,
+    reporting,
+    ssh_bootstrap,
+    xray_config,
+)
 from orchestrator.remnawave_client import NodeConnState, RemnawaveClient
 from orchestrator.statemachine import NodeState, can_transition
 from orchestrator.xray_config import TLS_CHOICES, InboundChoice
@@ -177,6 +186,21 @@ class ProvisionDeps:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     poll_attempts: int = POLL_ATTEMPTS
     poll_interval_sec: float = POLL_INTERVAL_SEC
+
+    # --- Швы разворота панели с нуля (provision_panel, ADR 0001). ---
+    # Регистрация админа + выпуск API-токена панели через HTTP. По умолчанию —
+    # боевой поток на httpx; в тестах фейк без сети.
+    provision_panel_admin: Callable[..., Awaitable[str]] = (
+        panel_setup.provision_panel_admin
+    )
+    # Фабрика локального compose (вариант «local»): (base_dir) → LocalCompose.
+    # По умолчанию боевая; в тестах подменяется фейком без docker.
+    make_local_compose: Callable[[str], local_compose.LocalCompose] = (
+        local_compose.LocalCompose
+    )
+    # Запись Panel/токена панели после успешного разворота (привязана к owner,
+    # достраивается в build_panel_deps). None — шаг пропускается.
+    persist_panel: Callable[..., Awaitable[None]] | None = None
 
 
 class _Pipeline:
@@ -737,6 +761,307 @@ async def provision_node(ctx: dict, payload: dict) -> None:
     await _Pipeline(payload, deps).execute()
 
 
+# ==========================================================================
+# Разворот панели Remnawave с нуля (режим «new», ADR 0001).
+# ==========================================================================
+# Своя мини-пайплайн-логика, отдельная от provision_node: панель — это не нода,
+# у неё другой набор шагов (свой стек compose + Caddy + регистрация админа) и
+# другие отчётные статусы. State-машину нод тут не используем — прогресс
+# показываем простыми текстовыми отчётами через тот же report-шов.
+
+# Ожидание готовности панели после старта стека. Чуть длиннее, чем у ноды:
+# первый старт тянет образы и гоняет миграции БД.
+PANEL_READY_ATTEMPTS = 60
+PANEL_READY_INTERVAL_SEC = 5.0
+
+
+class _PanelPipeline:
+    """Прогон разворота панели с нуля для одной задачи.
+
+    payload (из мастера бота): owner, placement (vps|local), panel_domain,
+    admin_username; admin_secret_vault_path — путь к транзитному паролю админа в
+    Vault; для vps ещё ip/login/auth и secret_vault_path (доступ-секрет
+    bootstrap, как у ноды). chat_id для отчётности. Сами пароли в payload не
+    лежат — только пути в Vault.
+    """
+
+    def __init__(self, payload: dict, deps: ProvisionDeps) -> None:
+        self.p = payload
+        self.deps = deps
+
+    async def _report(self, detail: str) -> None:
+        # У панели нет state-машины нод; шлём прогресс как PROVISIONING — это
+        # лишь канал доставки текста оператору (reporting сам подберёт заголовок).
+        await self.deps.report(NodeState.PROVISIONING, detail)
+
+    def _admin_password(self) -> str:
+        """Пароль супер-админа из Vault по admin_secret_vault_path (транзит).
+
+        В payload пароля нет — там только путь, как у bootstrap-секрета ноды.
+        Без vault_get или пути читать неоткуда — это ошибка постановки задачи."""
+        path = self.p.get("admin_secret_vault_path")
+        if self.deps.vault_get is None or not path:
+            raise ProvisionError("нет доступа к паролю админа (admin_secret_vault_path)")
+        try:
+            data = self.deps.vault_get(path)
+        except Exception as exc:  # noqa: BLE001 — нет секрета/Vault недоступен
+            raise ProvisionError(f"пароль админа недоступен: {exc}") from exc
+        password = (data or {}).get("password")
+        if not password:
+            raise ProvisionError("в Vault нет пароля админа панели")
+        return password
+
+    def _drop_admin_secret(self) -> None:
+        """Стереть транзитный пароль админа из Vault — он больше не нужен.
+
+        Best-effort, как _drop_bootstrap_secret: ошибка удаления не должна валить
+        уже состоявшийся разворот."""
+        path = self.p.get("admin_secret_vault_path")
+        if self.deps.vault_delete is None or not path:
+            return
+        try:
+            self.deps.vault_delete(path)
+        except Exception:  # noqa: BLE001 — удаление транзита не критично
+            logger.exception("не удалось стереть транзитный пароль админа")
+
+    def _read_bootstrap_secret(self) -> dict:
+        """Транзитный доступ-секрет bootstrap для vps-разворота (как у ноды)."""
+        path = self.p.get("secret_vault_path")
+        if self.deps.vault_get is None or not path:
+            raise ProvisionError("нет доступа к секрету bootstrap (secret_vault_path)")
+        try:
+            return self.deps.vault_get(path) or {}
+        except Exception as exc:  # noqa: BLE001
+            raise ProvisionError(f"секрет bootstrap недоступен: {exc}") from exc
+
+    def _drop_bootstrap_secret(self) -> None:
+        path = self.p.get("secret_vault_path")
+        if self.deps.vault_delete is None or not path:
+            return
+        try:
+            self.deps.vault_delete(path)
+        except Exception:  # noqa: BLE001
+            logger.exception("не удалось стереть транзитный секрет bootstrap панели")
+
+    async def _bootstrap_vps(self) -> str:
+        """Bootstrap сервера панели на ключ (ветка vps), переиспользуя швы ноды.
+
+        Доступ-секрет берём из Vault по secret_vault_path. Возвращает приватный
+        ключ для дальнейших ansible-прогонов. Здесь нет resume по node_id (панель
+        — отдельная сущность); при повторе bootstrap_key/-password просто пройдёт
+        заново, что безопасно (необратимое в bootstrap — только отключение пароля,
+        идемпотентное)."""
+        ip = self.p["ip"]
+        login = self.p["login"]
+        auth = self.p["auth"]
+        secret = self._read_bootstrap_secret()
+        if auth == "password":
+            result = await self.deps.bootstrap_password(
+                ip, login, secret.get("password", "")
+            )
+        elif auth == "key":
+            result = await self.deps.bootstrap_key(
+                ip, login, secret.get("private_key", "")
+            )
+        else:
+            raise ProvisionError(f"неизвестный способ доступа: {auth!r}")
+        if not result.ok or not result.private_key:
+            raise ProvisionError(result.detail or "bootstrap панели не удался")
+        self._drop_bootstrap_secret()
+        return result.private_key
+
+    def _panel_url(self) -> str:
+        """URL панели для регистрации: https://<домен> (Caddy выпускает TLS)."""
+        domain_name = self.p["panel_domain"]
+        return f"https://{domain_name}"
+
+    async def _deploy_vps(self, domain_name: str, secrets_: panel_stack.PanelSecrets) -> None:
+        """Развернуть стек панели на отдельном VPS через ansible.
+
+        Bootstrap → hardening (UFW) → deploy_panel.yml (docker + стек + Caddy +
+        открытие 80/443). Секреты панели уходят в extra-vars, не в payload очереди.
+        """
+        ip = self.p["ip"]
+        login = self.p["login"]
+        await self._report(f"Подключаюсь к серверу панели {ip}")
+        private_key = await self._bootstrap_vps()
+
+        await self._report("Настраиваю сервер панели")
+        hardening = await self.deps.run_playbook(
+            ansible_runner.HARDENING_PLAYBOOK, ip, login, private_key
+        )
+        if not hardening.ok:
+            raise ProvisionError(hardening.detail)
+
+        await self._report("Разворачиваю стек панели (docker, Caddy, TLS)")
+        deploy = await self.deps.run_playbook(
+            ansible_runner.DEPLOY_PANEL_PLAYBOOK,
+            ip,
+            login,
+            private_key,
+            extra_vars={
+                "panel_domain": domain_name,
+                "panel_jwt_auth_secret": secrets_.jwt_auth_secret,
+                "panel_jwt_api_tokens_secret": secrets_.jwt_api_tokens_secret,
+                "panel_metrics_pass": secrets_.metrics_pass,
+                "panel_postgres_password": secrets_.postgres_password,
+            },
+        )
+        if not deploy.ok:
+            raise ProvisionError(deploy.detail)
+
+    async def _deploy_local(self, domain_name: str, secrets_: panel_stack.PanelSecrets) -> None:
+        """Развернуть стек панели на хосте деплойера через docker-сокет хоста.
+
+        Рендерим файлы стека и запускаем docker compose локально (без SSH). Шов
+        make_local_compose в тестах — фейк без docker.
+        """
+        await self._report("Готовлю файлы стека панели на хосте деплойера")
+        base_dir = self.p.get("panel_local_dir") or settings.panel_local_dir
+        stack = self.deps.make_local_compose(base_dir)
+        compose = panel_stack.render_compose()
+        caddyfile = panel_stack.render_caddyfile(domain_name)
+        env = panel_stack.render_env(domain_name, secrets_)
+        cwd = stack.write_stack(compose, caddyfile, env)
+        await self._report("Поднимаю стек панели (docker compose up)")
+        try:
+            stack.up(cwd)
+        except local_compose.LocalComposeError as exc:
+            raise ProvisionError(str(exc)) from exc
+
+    async def _register_admin(self, panel_url: str) -> str:
+        """Дождаться панели, зарегистрировать админа, выдать API-токен.
+
+        Пароль админа читаем из Vault (транзит) и после успеха стираем — в логи
+        и payload он не попадает. Возвращает долгоживущий токен панели.
+        """
+        await self._report("Жду готовности панели и регистрирую администратора")
+        username = self.p["admin_username"]
+        password = self._admin_password()
+        try:
+            token = await self.deps.provision_panel_admin(
+                panel_url,
+                username,
+                password,
+                sleep=self.deps.sleep,
+                ready_attempts=PANEL_READY_ATTEMPTS,
+                ready_interval_sec=PANEL_READY_INTERVAL_SEC,
+            )
+        except panel_setup.PanelSetupError as exc:
+            raise ProvisionError(str(exc)) from exc
+        finally:
+            del password
+        self._drop_admin_secret()
+        return token
+
+    async def _persist(self, panel_url: str, token: str) -> None:
+        """Сохранить панель как обычную «существующую»: токен в Vault, Panel в БД.
+
+        Дальше ноды добавляются текущим флоу (бот увидит сохранённую панель).
+        Best-effort на запись в БД, как persist_node: сбой записи не отменяет
+        уже развёрнутую панель.
+        """
+        if self.deps.persist_panel is None:
+            return
+        try:
+            await self.deps.persist_panel(url=panel_url, token=token)
+        except Exception:  # noqa: BLE001 — запись метаданных не критична
+            logger.exception("persist_panel: не удалось сохранить панель")
+
+    async def _run(self) -> None:
+        placement = self.p.get("placement", "vps")
+        domain_name = self.p["panel_domain"]
+        secrets_ = panel_stack.PanelSecrets()
+
+        if placement == "vps":
+            await self._deploy_vps(domain_name, secrets_)
+        elif placement == "local":
+            await self._deploy_local(domain_name, secrets_)
+        else:
+            raise ProvisionError(f"неизвестное размещение панели: {placement!r}")
+
+        panel_url = self._panel_url()
+        token = await self._register_admin(panel_url)
+        await self._persist(panel_url, token)
+        await self._report(
+            "Панель готова. Можно добавлять ноды — она уже сохранена."
+        )
+
+    async def execute(self) -> None:
+        try:
+            await self._run()
+        except ProvisionError as exc:
+            await self.deps.report(NodeState.FAILED, str(exc))
+        except Exception as exc:  # noqa: BLE001 — непредвиденное не должно ронять воркер
+            logger.exception("provision_panel: непредвиденный сбой")
+            await self.deps.report(NodeState.FAILED, f"внутренняя ошибка: {exc}")
+
+
+def build_panel_deps(ctx: dict, payload: dict) -> ProvisionDeps:
+    """Боевые зависимости для разворота панели.
+
+    Отличие от build_production_deps: отчёт привязан к chat_id (а не к node_id —
+    у панели нет строки Node), и достраивается persist_panel (запись Panel в БД +
+    токен в Vault по panels/{owner}/token). owner/chat_id берутся из payload.
+    """
+    from db import get_sessionmaker
+    from db.repo import get_or_create_panel
+    from secretstore.vault import VaultStore
+
+    owner = payload.get("owner")
+    chat_id = payload.get("chat_id")
+    bot = ctx.get("bot")
+    vault = VaultStore()
+
+    notify = None
+    if bot is not None:
+        async def notify(cid: int, text: str) -> None:  # noqa: F811
+            await bot.send_message(cid, text)
+
+    async def report(state: NodeState, detail: str) -> None:
+        # У панели нет node_id, поэтому в БД статус не пишем — только в чат.
+        if notify is not None and chat_id is not None:
+            try:
+                await notify(chat_id, reporting.format_status(state, detail))
+            except Exception:  # noqa: BLE001 — сбой Telegram не валит разворот
+                logger.exception("provision_panel report: сбой доставки в чат")
+
+    persist_panel = None
+    if owner is not None:
+        session_factory = get_sessionmaker()
+
+        async def persist_panel(*, url: str, token: str) -> None:  # noqa: F811
+            token_path = f"panels/{owner}/token"
+            vault.put(token_path, {"token": token})
+            await get_or_create_panel(
+                session_factory, owner_tg_id=owner, url=url,
+                token_vault_path=token_path,
+            )
+
+    return ProvisionDeps(
+        report=report,
+        vault_get=vault.get,
+        vault_put=vault.put,
+        vault_delete=vault.delete,
+        persist_panel=persist_panel,
+    )
+
+
+async def provision_panel(ctx: dict, payload: dict) -> None:
+    """Разворот панели Remnawave с нуля (режим «new», ADR 0001).
+
+    payload (из мастера бота): owner, chat_id, placement (vps|local),
+    panel_domain, admin_username; admin_secret_vault_path — путь к транзитному
+    паролю админа в Vault; для vps — ip/login/auth и secret_vault_path
+    (доступ-секрет bootstrap). Сами пароли в payload не лежат, только пути.
+
+    Зависимости берутся из ctx["deps"] (тесты); в проде собираются боевые через
+    build_panel_deps.
+    """
+    deps = ctx.get("deps") or build_panel_deps(ctx, payload)
+    await _PanelPipeline(payload, deps).execute()
+
+
 async def _worker_startup(ctx: dict) -> None:
     """Поднять общие на воркер ресурсы: Telegram-бот и таблицы БД."""
     from aiogram import Bot
@@ -756,7 +1081,7 @@ async def _worker_shutdown(ctx: dict) -> None:
 class WorkerSettings:
     """Конфиг arq-воркера: какие задачи обслуживаем и хуки жизненного цикла."""
 
-    functions = [provision_node]
+    functions = [provision_node, provision_panel]
     on_startup = _worker_startup
     on_shutdown = _worker_shutdown
     redis_settings = RedisSettings(host=settings.redis_host,
