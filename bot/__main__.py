@@ -13,6 +13,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import BotCommand
 
+from bot.access import WhitelistMiddleware
 from bot.handlers import router
 from config import settings
 from db import init_models
@@ -27,6 +28,14 @@ async def main() -> None:
     )
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=storage)
+
+    # Барьер доступа: пускаем только владельцев из ALLOWED_TELEGRAM_IDS. Вешаем
+    # внешним middleware и на сообщения, и на callback'и, чтобы отсечь чужих до
+    # хендлеров. Список читаем лениво из settings — он один на процесс.
+    access = WhitelistMiddleware(lambda: settings.allowed_telegram_ids)
+    dp.message.outer_middleware(access)
+    dp.callback_query.outer_middleware(access)
+
     dp.include_router(router)
 
     await bot.set_my_commands([

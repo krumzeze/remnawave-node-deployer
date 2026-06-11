@@ -1,4 +1,5 @@
 """Единая конфигурация из окружения (.env)."""
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -6,6 +7,17 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     bot_token: str = ""
+
+    # Белый список владельцев бота: строка вида "111,222" из .env
+    # (ALLOWED_TELEGRAM_IDS). Пустая строка = список пуст, и бот считается
+    # ненастроенным (никого не пускает) — см. bot/access.py. Разбор в множество
+    # int — в свойстве allowed_telegram_ids.
+    allowed_telegram_ids_raw: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "ALLOWED_TELEGRAM_IDS", "allowed_telegram_ids_raw"
+        ),
+    )
 
     postgres_host: str = "postgres"
     postgres_port: int = 5432
@@ -32,6 +44,21 @@ class Settings(BaseSettings):
             f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def allowed_telegram_ids(self) -> set[int]:
+        """ID Telegram, которым разрешён бот. Разбираем строку по запятым,
+        пустые и нечисловые токены пропускаем. Пустой результат — бот закрыт
+        для всех (ненастроен)."""
+        result: set[int] = set()
+        for token in self.allowed_telegram_ids_raw.split(","):
+            token = token.strip()
+            if token:
+                try:
+                    result.add(int(token))
+                except ValueError:
+                    continue
+        return result
 
 
 settings = Settings()
