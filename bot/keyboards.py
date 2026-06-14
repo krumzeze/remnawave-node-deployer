@@ -10,7 +10,7 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.callbacks import MenuCB, NodeCB, PanelCB, WizCB
+from bot.callbacks import MenuCB, NodeCB, PanelCB, PanelSettingsCB, WizCB
 from config import settings
 
 # Значок состояния ноды для списка. Состояния — из state-машины провижининга
@@ -85,7 +85,20 @@ def panel_menu(has_panel: bool) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     label = "✏️ Сменить панель" if has_panel else "➕ Подключить панель"
     b.button(text=label, callback_data=PanelCB(action="change"))
+    # Настройки панель-уровня доступны только когда панель привязана.
+    if has_panel:
+        b.button(text="⚙️ Настройки панели", callback_data=PanelSettingsCB(action="open"))
     b.button(text="⬅️ В меню", callback_data=MenuCB(action="home"))
+    b.adjust(1)
+    return b.as_markup()
+
+
+def panel_settings_menu() -> InlineKeyboardMarkup:
+    """Экран панель-уровневых настроек. Пока один пункт — обход РФ через Happ;
+    сюда же лягут будущие настройки подписки/панели."""
+    b = InlineKeyboardBuilder()
+    b.button(text="🇷🇺 Включить обход РФ (Happ)", callback_data=PanelSettingsCB(action="ru_bypass"))
+    b.button(text="⬅️ К панели", callback_data=MenuCB(action="panel"))
     b.adjust(1)
     return b.as_markup()
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 from aiogram.filters.callback_data import CallbackData
 
 from bot import handlers, keyboards
-from bot.callbacks import MenuCB, NodeCB, WizCB
+from bot.callbacks import MenuCB, NodeCB, PanelSettingsCB, WizCB
 from bot.handlers import INBOUND_MENU
 
 
@@ -60,6 +60,23 @@ def test_squads_kb_toggle_marks():
     texts = [b.text for b in _all_buttons(markup)]
     assert "✅ vip" in texts
     assert "▫️ all" in texts
+
+
+def test_panel_menu_shows_settings_only_with_panel():
+    # Кнопка настроек панели появляется только когда панель привязана.
+    cbs = [b.callback_data for b in _all_buttons(keyboards.panel_menu(True))]
+    assert any(c.startswith("ps:") for c in cbs)
+    cbs_none = [b.callback_data for b in _all_buttons(keyboards.panel_menu(False))]
+    assert not any(c.startswith("ps:") for c in cbs_none)
+
+
+def test_panel_settings_menu_has_ru_bypass():
+    actions = [
+        PanelSettingsCB.unpack(b.callback_data).action
+        for b in _all_buttons(keyboards.panel_settings_menu())
+        if b.callback_data.startswith("ps:")
+    ]
+    assert "ru_bypass" in actions
 
 
 def test_nodes_list_buttons_carry_node_id():

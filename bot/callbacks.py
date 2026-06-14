@@ -26,6 +26,15 @@ class PanelCB(CallbackData, prefix="p"):
     action: str  # change
 
 
+class PanelSettingsCB(CallbackData, prefix="ps"):
+    """Настройки привязанной панели (слой панель-уровневых настроек).
+
+    Сюда складываются действия, которые меняют саму панель, а не ноды: первое —
+    обход РФ через Happ-routing. Дальше список будет расширяться.
+    """
+    action: str  # open | ru_bypass
+
+
 class WizCB(CallbackData, prefix="w"):
     """Шаги мастера добавления ноды.
 

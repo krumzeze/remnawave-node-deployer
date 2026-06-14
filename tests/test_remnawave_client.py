@@ -115,6 +115,19 @@ class _FakeSquads:
         return types.SimpleNamespace()
 
 
+class _FakeSubSettings:
+    def __init__(self, happ_routing=None):
+        self.updated_body = None
+        self._happ_routing = happ_routing
+
+    async def get_subscription_settings(self):
+        return types.SimpleNamespace(uuid="sub-1", happ_routing=self._happ_routing)
+
+    async def update_subscription_settings(self, body):
+        self.updated_body = body
+        return types.SimpleNamespace()
+
+
 class _FakeSDK:
     def __init__(self, node, hosts=None):
         self.nodes = _FakeNodes(node)
@@ -122,6 +135,7 @@ class _FakeSDK:
         self.config_profiles = _FakeProfiles()
         self.hosts = hosts if hosts is not None else _FakeHosts()
         self.internal_squads = _FakeSquads()
+        self.subscriptions_settings = _FakeSubSettings()
 
 
 def _client(node):
@@ -335,3 +349,24 @@ async def test_add_inbounds_to_squads_noop_on_empty():
     await c.add_inbounds_to_squads([], ["inb-1"])
     await c.add_inbounds_to_squads(["sq-1"], [])
     assert sdk.internal_squads.updated == []
+
+
+@pytest.mark.asyncio
+async def test_get_subscription_settings():
+    c = _client(_FakeNode())
+    s = await c.get_subscription_settings()
+    assert s.uuid == "sub-1"
+    assert s.happ_routing is None
+
+
+@pytest.mark.asyncio
+async def test_set_happ_routing_patches_by_uuid(monkeypatch):
+    # Захватываем (uuid, value), которые уйдут в PATCH; uuid берётся из GET.
+    monkeypatch.setattr(rc, "_build_update_subscription_settings_request",
+                        lambda uuid, value: (uuid, value))
+    sdk = _FakeSDK(_FakeNode())
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    await c.set_happ_routing("happ://routing/onadd/XYZ")
+
+    assert sdk.subscriptions_settings.updated_body == ("sub-1", "happ://routing/onadd/XYZ")
