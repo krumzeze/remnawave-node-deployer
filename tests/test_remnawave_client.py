@@ -120,10 +120,10 @@ class _FakeSubSettings:
         self.updated_body = None
         self._happ_routing = happ_routing
 
-    async def get_subscription_settings(self):
+    async def get_settings(self):
         return types.SimpleNamespace(uuid="sub-1", happ_routing=self._happ_routing)
 
-    async def update_subscription_settings(self, body):
+    async def update_settings(self, body):
         self.updated_body = body
         return types.SimpleNamespace()
 
@@ -360,13 +360,32 @@ async def test_get_subscription_settings():
 
 
 @pytest.mark.asyncio
-async def test_set_happ_routing_patches_by_uuid(monkeypatch):
-    # Захватываем (uuid, value), которые уйдут в PATCH; uuid берётся из GET.
+async def test_set_happ_routing_patches_current_settings(monkeypatch):
+    # Билдер подменяем каптюром: проверяем, что в update уходит тело, собранное
+    # из текущих настроек (read-modify-write), а не из урезанной обёртки.
     monkeypatch.setattr(rc, "_build_update_subscription_settings_request",
-                        lambda uuid, value: (uuid, value))
+                        lambda current, value: (current.uuid, value))
     sdk = _FakeSDK(_FakeNode())
     c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
 
     await c.set_happ_routing("happ://routing/onadd/XYZ")
 
     assert sdk.subscriptions_settings.updated_body == ("sub-1", "happ://routing/onadd/XYZ")
+
+
+def test_subscription_settings_payload_carries_fields_and_renames():
+    allowed = {"uuid", "profile_title", "is_show_custom_remarks", "happ_routing"}
+    # В ответе настройка зовётся show_custom_remarks, лишнее (created_at) отсечётся.
+    data = {
+        "uuid": "sub-1",
+        "profile_title": "My VPN",
+        "show_custom_remarks": True,
+        "created_at": "2026-01-01",
+    }
+    out = rc._subscription_settings_payload(data, allowed, "happ://routing/onadd/Z")
+
+    assert out["uuid"] == "sub-1"
+    assert out["profile_title"] == "My VPN"
+    assert out["is_show_custom_remarks"] is True   # перенесено из show_custom_remarks
+    assert out["happ_routing"] == "happ://routing/onadd/Z"
+    assert "created_at" not in out                 # нет в allowed — отброшено

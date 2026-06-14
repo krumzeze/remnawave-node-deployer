@@ -255,20 +255,43 @@ def _build_create_host_request(
     return CreateHostRequestDto(**kwargs)
 
 
-def _build_update_subscription_settings_request(uuid: str, happ_routing: str):
-    """Собрать UpdateSubscriptionSettingsRequestDto. Импорт ленивый, как у
-    прочих билдеров. Отправляем только uuid и happRouting — остальные настройки
-    подписки панель не трогает (частичный PATCH; так же делает обновлятор
-    happRouting у Remnawave). Поле в Python snake_case (happ_routing), наружу
-    сериализуется в happRouting."""
-    from uuid import UUID
+def _build_update_subscription_settings_request(current, happ_routing: str):
+    """Собрать UpdateSubscriptionSettingsRequestDto из текущих настроек подписки.
 
+    Read-modify-write: переносим все существующие значения настроек и меняем
+    только happ_routing. Иначе PATCH рискует обнулить прочие поля (profile_title,
+    support_link и др.): в запросном DTO они опциональны, и если SDK шлёт
+    незаданные поля как null — панель затрёт ими рабочие настройки подписки.
+    Перенос всех значений безопасен при любой сериализации.
+
+    Имена полей у ответа и запроса в основном совпадают (snake_case), но есть
+    расхождение: в ответе настройка зовётся show_custom_remarks, а в запросе —
+    is_show_custom_remarks; переносим её отдельно. Импорт ленивый, как у прочих
+    билдеров."""
     from remnawave.models import UpdateSubscriptionSettingsRequestDto
 
-    return UpdateSubscriptionSettingsRequestDto(
-        uuid=UUID(str(uuid)),
-        happ_routing=happ_routing,
-    )
+    allowed = set(UpdateSubscriptionSettingsRequestDto.model_fields)
+    payload = _subscription_settings_payload(current.model_dump(), allowed, happ_routing)
+    return UpdateSubscriptionSettingsRequestDto(**payload)
+
+
+def _subscription_settings_payload(
+    data: dict, allowed: set[str], happ_routing: str
+) -> dict:
+    """Отобрать поля текущих настроек под запросный DTO и подменить happ_routing.
+
+    Берём из ответа только те ключи, что есть в запросном DTO; переносим
+    show_custom_remarks → is_show_custom_remarks (разные имена у ответа и
+    запроса). Чистая функция — без импорта remnawave, тестируется отдельно."""
+    payload = {k: v for k, v in data.items() if k in allowed}
+    if (
+        "is_show_custom_remarks" in allowed
+        and "is_show_custom_remarks" not in payload
+        and "show_custom_remarks" in data
+    ):
+        payload["is_show_custom_remarks"] = data["show_custom_remarks"]
+    payload["happ_routing"] = happ_routing
+    return payload
 
 
 def _build_update_squad_request(uuid: str, inbound_uuids: list[str]):
@@ -550,7 +573,7 @@ class RemnawaveClient:
 
         В 2.7.x настройки подписки — единственная запись; правка идёт PATCH'ем по
         её uuid, поэтому его сперва читаем."""
-        resp = await self._sdk.subscriptions_settings.get_subscription_settings()
+        resp = await self._sdk.subscriptions_settings.get_settings()
         return SubscriptionSettingsRef(
             uuid=str(resp.uuid),
             happ_routing=getattr(resp, "happ_routing", None),
@@ -562,7 +585,8 @@ class RemnawaveClient:
         Панель прикладывает happRouting к ответу подписки, и Happ-клиенты
         подхватывают профиль при обновлении подписки — изменение глобальное,
         ноды не трогаем (см. orchestrator/happ_routing). Read-modify-write:
-        сначала читаем uuid настроек, затем PATCH с новым значением."""
-        current = await self.get_subscription_settings()
-        body = _build_update_subscription_settings_request(current.uuid, deeplink)
-        await self._sdk.subscriptions_settings.update_subscription_settings(body=body)
+        читаем все текущие настройки подписки и пересылаем их обратно, меняя
+        только happ_routing, чтобы PATCH не обнулил прочие поля."""
+        current = await self._sdk.subscriptions_settings.get_settings()
+        body = _build_update_subscription_settings_request(current, deeplink)
+        await self._sdk.subscriptions_settings.update_settings(body=body)
