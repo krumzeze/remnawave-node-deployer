@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     # не используется. Пустая строка = фолбэк на дефолт ниже.
     panel_local_dir: str = "/opt/remnawave-panel"
 
+    # Временный тумблер сценария «развернуть панель с нуля» (ADR 0001/0011).
+    # Пока нет возможности прогнать разворот на живом сервере, прячем кнопку
+    # в боте и блокируем сценарий, оставляя код мастера на месте. Включить
+    # обратно: PANEL_FROM_SCRATCH_ENABLED=true в .env (или дефолт ниже на True).
+    panel_from_scratch_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "PANEL_FROM_SCRATCH_ENABLED", "panel_from_scratch_enabled"
+        ),
+    )
+
     web_host: str = "0.0.0.0"
     web_port: int = 8000
 

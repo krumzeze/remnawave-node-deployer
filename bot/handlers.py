@@ -606,6 +606,13 @@ async def wiz_cancel(query: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AddNode.choose_panel_mode, WizCB.filter(F.action == "pm"))
 async def wiz_panel_mode(query: CallbackQuery, callback_data: WizCB, state: FSMContext) -> None:
     if callback_data.val == "new":
+        # Сценарий временно отключён флагом, пока не проверен на живом сервере.
+        # Кнопку прячем в клавиатуре, но страхуемся и от старого callback.
+        if not settings.panel_from_scratch_enabled:
+            await query.answer(
+                "Разворот панели с нуля временно недоступен.", show_alert=True
+            )
+            return
         # Разворот панели с нуля (ADR 0001): сперва выбираем размещение, дальше
         # домен/логин/пароль и (для vps) доступ к серверу — см. wiz_placement.
         await state.update_data(panel_mode="new")

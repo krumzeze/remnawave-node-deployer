@@ -11,6 +11,7 @@ from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.callbacks import MenuCB, NodeCB, PanelCB, WizCB
+from config import settings
 
 # Значок состояния ноды для списка. Состояния — из state-машины провижининга
 # (orchestrator/statemachine.py): queued → bootstrapping → provisioning →
@@ -99,7 +100,9 @@ def cancel_only() -> InlineKeyboardMarkup:
 def panel_mode() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="Подключить существующую", callback_data=WizCB(action="pm", val="existing"))
-    b.button(text="Развернуть с нуля", callback_data=WizCB(action="pm", val="new"))
+    # Кнопка разворота с нуля скрыта, пока сценарий временно отключён флагом.
+    if settings.panel_from_scratch_enabled:
+        b.button(text="Развернуть с нуля", callback_data=WizCB(action="pm", val="new"))
     _cancel_button(b)
     b.adjust(1)
     return b.as_markup()
