@@ -29,7 +29,7 @@ from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 
 from bot import keyboards
-from bot.callbacks import MenuCB, NodeCB, PanelCB, PanelSettingsCB, WizCB
+from bot.callbacks import MenuCB, NodeCB, PanelCB, WizCB
 from bot.states import AddNode, SetPanel
 from config import settings
 from orchestrator import domain
@@ -545,54 +545,6 @@ async def menu_panel(query: CallbackQuery, state: FSMContext) -> None:
         text = "Панель пока не привязана. Подключи её один раз — дальше мастер не будет спрашивать."
     await _render(query, text, keyboards.panel_menu(saved is not None))
     await query.answer()
-
-
-_PANEL_SETTINGS_TEXT = (
-    "Настройки панели.\n\n"
-    "• Обход РФ (Happ) — добавляет в подписку routing-профиль: трафик на "
-    "российские сервисы идёт напрямую с домашнего IP, остальное — через ноды. "
-    "Профиль применяется у всех подписчиков автоматически при обновлении подписки."
-)
-
-
-@router.callback_query(PanelSettingsCB.filter(F.action == "open"))
-async def panel_settings_open(query: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    saved = await _load_saved_panel(_owner_of(query))
-    if not saved:
-        await query.answer("Сначала привяжи панель.", show_alert=True)
-        return
-    await _render(query, _PANEL_SETTINGS_TEXT, keyboards.panel_settings_menu())
-    await query.answer()
-
-
-@router.callback_query(PanelSettingsCB.filter(F.action == "ru_bypass"))
-async def panel_settings_ru_bypass(query: CallbackQuery, state: FSMContext) -> None:
-    """Записать в панель Happ-routing профиль обхода РФ (research/ru-bypass).
-
-    Один read-modify-write на панель: клиент читает uuid настроек подписки и
-    PATCH'ит happRouting. Это панель-уровень — ноды не трогаем."""
-    saved = await _load_saved_panel(_owner_of(query))
-    if not saved:
-        await query.answer("Сначала привяжи панель.", show_alert=True)
-        return
-    url, token = saved
-    from orchestrator.happ_routing import build_ru_bypass_deeplink
-
-    try:
-        client = _make_client(url, token)
-        await client.set_happ_routing(build_ru_bypass_deeplink())
-    except Exception as exc:  # noqa: BLE001 — сеть/панель не должны ронять экран
-        logger.warning("не удалось включить обход РФ: %s", exc)
-        await query.answer("Не получилось применить. Проверь панель и токен.", show_alert=True)
-        return
-    await _render(
-        query,
-        _PANEL_SETTINGS_TEXT
-        + "\n\n✅ Обход РФ включён. Клиенты подхватят профиль при обновлении подписки.",
-        keyboards.panel_settings_menu(),
-    )
-    await query.answer("Включено")
 
 
 @router.callback_query(PanelCB.filter(F.action == "change"))
