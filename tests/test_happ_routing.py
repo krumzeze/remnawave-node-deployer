@@ -16,7 +16,12 @@ from orchestrator.happ_routing import (
 
 def test_profile_keeps_ru_direct_and_rest_proxied():
     assert RU_BYPASS_PROFILE["GlobalProxy"] == "true"
-    assert RU_BYPASS_PROFILE["DirectSites"] == ["geosite:ru", "geosite:geolocation-ru"]
+    # Покрытие РФ строим на domain: (не зависит от geosite.dat) — geosite:ru там
+    # нет и он ронял ядро. Весь .ru/.рф/.su плюс geoip:ru как добивка.
+    direct = RU_BYPASS_PROFILE["DirectSites"]
+    assert "domain:ru" in direct
+    assert "domain:xn--p1ai" in direct
+    assert not any(s.startswith("geosite:") and s.endswith(":ru") for s in direct)
     assert "geoip:ru" in RU_BYPASS_PROFILE["DirectIp"]
     assert "geoip:private" in RU_BYPASS_PROFILE["DirectIp"]
 

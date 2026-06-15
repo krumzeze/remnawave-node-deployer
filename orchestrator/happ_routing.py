@@ -27,10 +27,20 @@ import json
 # (Cloudflare DoH) для проксируемых ресурсов, Domestic DNS (Яндекс) для
 # direct-ресурсов — отдельной защиты от DNS-утечек не требуется.
 #
-# Категория РФ-сайтов — geosite:ru/geosite:geolocation-ru, как в официальном
-# примере обхода РФ у Happ и в их routing-билдере. Раньше тут стояло
-# geosite:category-ru (тег из geosite.dat v2fly): в предустановленной базе Happ
-# такого тега нет, правило не матчило ничего, и весь РФ-трафик уходил в туннель.
+# Охват РФ-сайтов. Главное — не зависеть от geosite-базы Happ (Loyalsoldier):
+# кода geosite:ru/geosite:geolocation-ru там нет, и Xray грузит .dat при старте,
+# нормализуя код в верхний регистр, — на отсутствующем коде ядро падает с
+# «code not found in geosite.dat: RU», и Happ вообще не стартует. А имеющийся
+# geosite:category-ru — около 230 доменов на всю Россию, мимо него уходила
+# основная масса РФ-трафика.
+#
+# Поэтому ядро покрытия — правила domain:, которые в geosite.dat не лезут вообще
+# (буквальное совпадение по суффиксу): domain:ru/xn--p1ai/su накрывают весь
+# российский TLD одним махом и не могут уронить ядро. geoip:ru в DirectIp при
+# DomainStrategy=IPIfNonMatch добивает российские сервисы на .com (домен
+# резолвится, IP оказывается российским → direct). geosite:category-ru и явный
+# domain:vk.com — добивка поверх (category-ru у клиента грузится, краша на нём
+# не было).
 RU_BYPASS_PROFILE: dict = {
     "Name": "RU bypass",
     "GlobalProxy": "true",
@@ -39,7 +49,13 @@ RU_BYPASS_PROFILE: dict = {
     "RemoteDNSIP": "1.1.1.1",
     "DomesticDNSType": "DoU",
     "DomesticDNSIP": "77.88.8.8",
-    "DirectSites": ["geosite:ru", "geosite:geolocation-ru"],
+    "DirectSites": [
+        "domain:ru",
+        "domain:xn--p1ai",
+        "domain:su",
+        "domain:vk.com",
+        "geosite:category-ru",
+    ],
     "DirectIp": ["geoip:ru", "geoip:private"],
     "ProxySites": [],
     "ProxyIp": [],
