@@ -94,6 +94,43 @@ async def create_node_record(
         return node.id
 
 
+async def import_panel_node(
+    session_factory: async_sessionmaker,
+    *,
+    panel_id: int,
+    remnawave_uuid: str,
+    ip: str,
+    state: str,
+) -> bool:
+    """Завести ноду, уже существующую в панели, в локальный список (find-or-create).
+
+    Для кнопки «Синхронизировать»: ноды, заведённые в панели не через бота,
+    подтягиваем сюда, чтобы они были видны и отслеживались. Дедупликация по
+    (panel_id, remnawave_uuid) — стабильнее, чем по ip, и не плодит дубли при
+    повторном синке. Если нода с таким uuid уже есть (импортирована раньше или
+    заведена ботом — у ботовой uuid проставляется после регистрации), не трогаем
+    её и возвращаем False; новую создаём и возвращаем True.
+
+    SSH-ключа от чужой ноды у нас нет, поэтому ssh_key_vault_path остаётся NULL:
+    такая нода частично функциональна (виден статус, но нет действий по SSH).
+    """
+    async with session_factory() as session:
+        existing = await session.scalar(
+            select(Node).where(
+                Node.panel_id == panel_id,
+                Node.remnawave_uuid == remnawave_uuid,
+            )
+        )
+        if existing is not None:
+            return False
+        node = Node(
+            panel_id=panel_id, ip=ip, state=state, remnawave_uuid=remnawave_uuid
+        )
+        session.add(node)
+        await session.commit()
+        return True
+
+
 async def set_node_fields(
     session_factory: async_sessionmaker,
     node_id: int,

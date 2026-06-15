@@ -42,6 +42,47 @@ async def test_create_node_record_starts_queued(sm):
 
 
 @pytest.mark.asyncio
+async def test_import_panel_node_creates_then_dedups(sm):
+    panel_id = await repo.get_or_create_panel(
+        sm, owner_tg_id=1, url="https://p", token_vault_path="t"
+    )
+    # Первый синк: ноды нет — создаём, без SSH-ключа, со статусом панели.
+    created = await repo.import_panel_node(
+        sm, panel_id=panel_id, remnawave_uuid="rw-1", ip="1.2.3.4", state="online"
+    )
+    assert created is True
+    # Повторный синк той же ноды — дубль не создаём.
+    again = await repo.import_panel_node(
+        sm, panel_id=panel_id, remnawave_uuid="rw-1", ip="1.2.3.4", state="offline"
+    )
+    assert again is False
+
+    nodes = await repo.list_nodes_for_owner(sm, owner_tg_id=1)
+    assert len(nodes) == 1
+    node = nodes[0]
+    assert node.remnawave_uuid == "rw-1"
+    assert node.state == "online"           # повторный синк не перетёр статус
+    assert node.ssh_key_vault_path is None  # чужая нода — ключа нет
+
+
+@pytest.mark.asyncio
+async def test_import_panel_node_skips_bot_node_with_same_uuid(sm):
+    # Ботовая нода с проставленным uuid не должна задваиваться при синке.
+    panel_id = await repo.get_or_create_panel(
+        sm, owner_tg_id=1, url="https://p", token_vault_path="t"
+    )
+    node_id = await repo.create_node_record(sm, panel_id=panel_id, ip="1.1.1.1")
+    await repo.set_node_fields(sm, node_id, remnawave_uuid="rw-bot")
+
+    created = await repo.import_panel_node(
+        sm, panel_id=panel_id, remnawave_uuid="rw-bot", ip="1.1.1.1", state="online"
+    )
+    assert created is False
+    nodes = await repo.list_nodes_for_owner(sm, owner_tg_id=1)
+    assert len(nodes) == 1
+
+
+@pytest.mark.asyncio
 async def test_get_or_create_panel_is_idempotent(sm):
     a = await repo.get_or_create_panel(
         sm, owner_tg_id=1, url="https://p", token_vault_path="t"

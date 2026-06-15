@@ -12,7 +12,7 @@ from aiogram.filters.callback_data import CallbackData
 
 class MenuCB(CallbackData, prefix="m"):
     """Главное меню и навигация между его разделами."""
-    action: str  # home | add | nodes | panel
+    action: str  # home | add | nodes | sync | panel
 
 
 class NodeCB(CallbackData, prefix="n"):

@@ -381,25 +381,35 @@ class RemnawaveClient:
         node = await self._sdk.nodes.create_node(body=body)
         return _to_info(node)
 
-    async def _find_node_by_address(self, address: str) -> NodeInfo | None:
-        """Найти зарегистрированную ноду по адресу, либо None.
+    async def list_nodes(self) -> list[NodeInfo]:
+        """Все ноды панели как доменные NodeInfo.
 
-        Нужно для идемпотентности create_node. Защитно: если у SDK нет метода
-        листинга или он упал/отдал неожиданную форму — возвращаем None и идём
-        обычным путём создания (хуже дубль, чем падение всего провижина)."""
+        Нужно для синка существующих нод в бота (кнопка «Синхронизировать») и для
+        идемпотентности create_node (см. _find_node_by_address). Защитно, как и
+        list_hosts: нет метода листинга у SDK или вызов упал/отдал неожиданную
+        форму — возвращаем пустой список вместо падения. Форма ответа SDK 2.7.x —
+        объект с `.nodes`, либо голый список."""
         getter = getattr(self._sdk.nodes, "get_all_nodes", None)
         if getter is None:
-            return None
+            return []
         try:
             resp = await getter()
-        except Exception:  # noqa: BLE001 — недоступность листинга не ломает создание
-            return None
+        except Exception:  # noqa: BLE001 — недоступность листинга не ломает вызывающий код
+            return []
         nodes = getattr(resp, "nodes", None)
         if nodes is None:
             nodes = resp if isinstance(resp, list) else []
-        for node in nodes:
-            if getattr(node, "address", None) == address:
-                return _to_info(node)
+        return [_to_info(n) for n in nodes]
+
+    async def _find_node_by_address(self, address: str) -> NodeInfo | None:
+        """Найти зарегистрированную ноду по адресу, либо None.
+
+        Нужно для идемпотентности create_node. Листинг защитный (см. list_nodes):
+        недоступен — вернётся [], и create_node пойдёт обычным путём создания
+        (хуже дубль, чем падение всего провижина)."""
+        for node in await self.list_nodes():
+            if node.address == address:
+                return node
         return None
 
     async def get_node_status(self, uuid: str) -> NodeConnState:

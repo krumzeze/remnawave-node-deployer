@@ -472,6 +472,58 @@ async def menu_nodes(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer()
 
 
+@router.callback_query(MenuCB.filter(F.action == "sync"))
+async def menu_nodes_sync(query: CallbackQuery, state: FSMContext) -> None:
+    """Подтянуть ноды, заведённые в панели не через бота, в локальный список.
+
+    Импорт по запросу (а не на привязке панели): оператор сам решает, тащить ли
+    старые ноды, и привязка панели не тормозит. Дедуп по (panel_id, uuid) в
+    repo.import_panel_node, поэтому повторный синк не плодит дубли. Состояние
+    импортированной ноды — живой статус панели. SSH-ключа от чужих нод нет:
+    они частично функциональны (виден статус, но нет действий по SSH)."""
+    await state.clear()
+    owner = _owner_of(query)
+    from db import get_sessionmaker
+    from db.repo import get_saved_panel, import_panel_node, list_nodes_for_owner
+
+    sm = get_sessionmaker()
+    panel = await get_saved_panel(sm, owner)
+    if panel is None:
+        await query.answer("Сначала привяжи панель в разделе «Панель».", show_alert=True)
+        return
+    saved = await _load_saved_panel(owner)
+    if not saved:
+        await query.answer("Не удалось прочитать токен панели из Vault.", show_alert=True)
+        return
+    url, token = saved
+    try:
+        client = _make_client(url, token)
+        panel_nodes = await client.list_nodes()
+    except Exception as exc:  # noqa: BLE001 — недоступность панели не должна ронять экран
+        logger.warning("синк нод: не удалось получить список из панели: %s", exc)
+        await query.answer("Панель недоступна, попробуй позже.", show_alert=True)
+        return
+
+    created = 0
+    for n in panel_nodes:
+        if await import_panel_node(
+            sm, panel_id=panel.id, remnawave_uuid=n.uuid, ip=n.address,
+            state=n.status.value,
+        ):
+            created += 1
+
+    nodes = await list_nodes_for_owner(sm, owner)
+    if created:
+        head = f"Импортировано новых нод: {created}."
+    elif panel_nodes:
+        head = "Новых нод нет — всё уже в списке."
+    else:
+        head = "В панели нет нод для импорта."
+    text = f"{head}\n\nТвои ноды:" if nodes else head
+    await _render(query, text, keyboards.nodes_list(nodes))
+    await query.answer()
+
+
 @router.callback_query(NodeCB.filter(F.action == "open"))
 async def node_open(query: CallbackQuery, callback_data: NodeCB) -> None:
     from db import get_sessionmaker

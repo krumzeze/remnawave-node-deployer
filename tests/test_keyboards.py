@@ -35,6 +35,22 @@ def test_state_badge_known_and_unknown():
     assert keyboards.state_badge("weird") == "⚪️"
 
 
+def test_state_badge_imported_statuses():
+    # Импортированные ноды хранят живой статус панели — у него тоже есть значки.
+    assert keyboards.state_badge("connecting") == "🟡"
+    assert keyboards.state_badge("disabled") == "⏸"
+    assert keyboards.state_badge("offline") == "🔴"
+
+
+def test_nodes_list_has_sync_button():
+    actions = [
+        MenuCB.unpack(b.callback_data).action
+        for b in _all_buttons(keyboards.nodes_list([]))
+        if b.callback_data.startswith("m:")
+    ]
+    assert "sync" in actions
+
+
 def test_main_menu_has_three_actions():
     actions = []
     for btn in _all_buttons(keyboards.main_menu()):

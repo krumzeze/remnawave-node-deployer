@@ -15,6 +15,11 @@ from orchestrator import remnawave_client as rc
 from orchestrator.remnawave_client import NodeConnState, RemnawaveClient
 
 
+async def _async(value):
+    """Обернуть готовое значение в awaitable — для фейков get_all_nodes."""
+    return value
+
+
 class _FakeNode:
     """Имитация NodeResponseDto: только нужные поля."""
 
@@ -204,6 +209,58 @@ async def test_create_node_maps_response(monkeypatch):
 async def test_get_node_status_online():
     c = _client(_FakeNode(is_connected=True))
     assert await c.get_node_status("abc") is NodeConnState.ONLINE
+
+
+def _client_with_nodes(nodes_attr):
+    """Клиент, у которого sdk.nodes подменён на объект с заданным get_all_nodes.
+
+    Отдельно от общего _FakeSDK: добавлять get_all_nodes в _FakeNodes нельзя — это
+    включило бы идемпотентность create_node и сломало бы её тесты."""
+    sdk = _FakeSDK(_FakeNode())
+    sdk.nodes = nodes_attr
+    return RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_maps_response():
+    resp = types.SimpleNamespace(nodes=[
+        _FakeNode(uuid="n-1", address="1.1.1.1", is_connected=True),
+        _FakeNode(uuid="n-2", address="2.2.2.2", is_disabled=True),
+    ])
+    nodes_attr = types.SimpleNamespace(get_all_nodes=lambda: _async(resp))
+    c = _client_with_nodes(nodes_attr)
+
+    nodes = await c.list_nodes()
+    assert [n.uuid for n in nodes] == ["n-1", "n-2"]
+    assert nodes[0].status is NodeConnState.ONLINE
+    assert nodes[1].status is NodeConnState.DISABLED
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_accepts_bare_list():
+    resp = [_FakeNode(uuid="n-3", address="3.3.3.3")]
+    nodes_attr = types.SimpleNamespace(get_all_nodes=lambda: _async(resp))
+    c = _client_with_nodes(nodes_attr)
+
+    nodes = await c.list_nodes()
+    assert len(nodes) == 1
+    assert nodes[0].address == "3.3.3.3"
+    assert nodes[0].status is NodeConnState.OFFLINE
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_missing_method_returns_empty():
+    c = _client_with_nodes(types.SimpleNamespace(create_node=None))
+    assert await c.list_nodes() == []
+
+
+@pytest.mark.asyncio
+async def test_list_nodes_exception_returns_empty():
+    def _boom():
+        raise RuntimeError("панель недоступна")
+
+    c = _client_with_nodes(types.SimpleNamespace(get_all_nodes=_boom))
+    assert await c.list_nodes() == []
 
 
 @pytest.mark.asyncio

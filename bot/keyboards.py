@@ -15,13 +15,17 @@ from config import settings
 
 # Значок состояния ноды для списка. Состояния — из state-машины провижининга
 # (orchestrator/statemachine.py): queued → bootstrapping → provisioning →
-# registering → online, плюс failed/rolled_back.
+# registering → online, плюс failed/rolled_back. Импортированные из панели ноды
+# хранят живой статус панели (NodeConnState): online/connecting/disabled/offline.
 _STATE_EMOJI = {
     "queued": "⏳",
     "bootstrapping": "🟡",
     "provisioning": "🟡",
     "registering": "🟡",
     "online": "🟢",
+    "connecting": "🟡",
+    "disabled": "⏸",
+    "offline": "🔴",
     "failed": "🔴",
     "rolled_back": "🔴",
 }
@@ -58,6 +62,7 @@ def nodes_list(nodes) -> InlineKeyboardMarkup:
             text=f"{state_badge(n.state)} {n.ip} — {n.state}",
             callback_data=NodeCB(action="open", node_id=n.id),
         )
+    b.button(text="🔄 Синхронизировать с панелью", callback_data=MenuCB(action="sync"))
     b.button(text="➕ Добавить ноду", callback_data=MenuCB(action="add"))
     b.button(text="⬅️ В меню", callback_data=MenuCB(action="home"))
     b.adjust(1)
