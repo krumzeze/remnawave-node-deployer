@@ -16,13 +16,14 @@ from orchestrator.happ_routing import (
 
 def test_profile_keeps_ru_direct_and_rest_proxied():
     assert RU_BYPASS_PROFILE["GlobalProxy"] == "true"
-    # Покрытие РФ строим на domain: (не зависит от geosite.dat) — geosite:ru там
-    # нет и он ронял ядро. Весь .ru/.рф/.su плюс geoip:ru как добивка.
+    # Охват РФ держится на своей geo-базе (дефолтная Loyalsoldier для РФ пустая)
+    # и geosite-кодах: Happ игнорирует правила domain:, geosite:ru ронял ядро.
+    assert RU_BYPASS_PROFILE["Geositeurl"].endswith("geosite.dat")
+    assert RU_BYPASS_PROFILE["Geoipurl"].endswith("geoip.dat")
     direct = RU_BYPASS_PROFILE["DirectSites"]
-    assert "domain:ru" in direct
-    assert "domain:xn--p1ai" in direct
-    assert not any(s.startswith("geosite:") and s.endswith(":ru") for s in direct)
-    assert "geoip:ru" in RU_BYPASS_PROFILE["DirectIp"]
+    assert "geosite:category-ru" in direct
+    assert all(s.startswith(("geosite:", "geoip:")) for s in direct)
+    assert not any(s.endswith(":ru") for s in direct)  # geosite:ru роняет ядро
     assert "geoip:private" in RU_BYPASS_PROFILE["DirectIp"]
 
 

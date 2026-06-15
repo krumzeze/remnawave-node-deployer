@@ -21,26 +21,30 @@ import base64
 import json
 
 # Routing-профиль «обход РФ». GlobalProxy=true — по умолчанию всё в туннель;
-# Direct* — исключения, которые идут мимо туннеля напрямую. Охват РФ задан
-# гео-категориями (geosite/geoip из встроенных баз Happ), приватные сети — чтобы
-# локалка и RFC1918 не заворачивались в туннель. DNS делится сам: Remote DNS
-# (Cloudflare DoH) для проксируемых ресурсов, Domestic DNS (Яндекс) для
-# direct-ресурсов — отдельной защиты от DNS-утечек не требуется.
+# Direct* — исключения, которые идут мимо туннеля напрямую. Приватные сети
+# (geosite/geoip:private) — чтобы локалка и RFC1918 не заворачивались в туннель.
+# DNS делится сам: Remote DNS (Cloudflare DoH) для проксируемых ресурсов,
+# Domestic DNS (Яндекс) для direct-ресурсов.
 #
-# Охват РФ-сайтов. Главное — не зависеть от geosite-базы Happ (Loyalsoldier):
-# кода geosite:ru/geosite:geolocation-ru там нет, и Xray грузит .dat при старте,
-# нормализуя код в верхний регистр, — на отсутствующем коде ядро падает с
-# «code not found in geosite.dat: RU», и Happ вообще не стартует. А имеющийся
-# geosite:category-ru — около 230 доменов на всю Россию, мимо него уходила
-# основная масса РФ-трафика.
+# Охват РФ держится на ДВУХ вещах вместе — и без них bypass не работает:
+#  1) своя geo-база (Geositeurl/Geoipurl). Дефолтная база Happ (Loyalsoldier)
+#     для РФ почти пустая: geosite:ru там нет вовсе (ядро Xray падает на старте
+#     с «code not found in geosite.dat: RU»), а geosite:category-ru — ~230
+#     доменов на всю страну. Поэтому подключаем базу roscomvpn, собранную именно
+#     под «РФ напрямую» (category-ru, category-geoblock-ru, whitelist).
+#  2) только geosite:/geoip:-токены в Direct-списках. Happ-роутер не понимает
+#     правила вида domain:ru — их он молча игнорирует (проверено: yandex.ru с
+#     domain:ru всё равно уходил в туннель). Совпадение домена работает лишь
+#     через geosite-категорию из базы.
+# DomainStrategy=IPIfNonMatch: домен без доменного совпадения резолвится и
+# матчится по IP (geoip), это добивает РФ-сервисы на чужих TLD.
 #
-# Поэтому ядро покрытия — правила domain:, которые в geosite.dat не лезут вообще
-# (буквальное совпадение по суффиксу): domain:ru/xn--p1ai/su накрывают весь
-# российский TLD одним махом и не могут уронить ядро. geoip:ru в DirectIp при
-# DomainStrategy=IPIfNonMatch добивает российские сервисы на .com (домен
-# резолвится, IP оказывается российским → direct). geosite:category-ru и явный
-# domain:vk.com — добивка поверх (category-ru у клиента грузится, краша на нём
-# не было).
+# База — внешний сторонний репозиторий (как и Loyalsoldier у самого Happ).
+# URL стабильный (jsDelivr отдаёт последний релиз с ветки release). Если нужна
+# независимость — базу можно зеркалировать у себя и поменять URL ниже.
+_ROSCOMVPN_GEOSITE = "https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geosite/release/geosite.dat"
+_ROSCOMVPN_GEOIP = "https://cdn.jsdelivr.net/gh/hydraponique/roscomvpn-geoip/release/geoip.dat"
+
 RU_BYPASS_PROFILE: dict = {
     "Name": "RU bypass",
     "GlobalProxy": "true",
@@ -49,14 +53,15 @@ RU_BYPASS_PROFILE: dict = {
     "RemoteDNSIP": "1.1.1.1",
     "DomesticDNSType": "DoU",
     "DomesticDNSIP": "77.88.8.8",
+    "Geoipurl": _ROSCOMVPN_GEOIP,
+    "Geositeurl": _ROSCOMVPN_GEOSITE,
     "DirectSites": [
-        "domain:ru",
-        "domain:xn--p1ai",
-        "domain:su",
-        "domain:vk.com",
+        "geosite:private",
         "geosite:category-ru",
+        "geosite:category-geoblock-ru",
+        "geosite:whitelist",
     ],
-    "DirectIp": ["geoip:ru", "geoip:private"],
+    "DirectIp": ["geoip:private", "geoip:direct"],
     "ProxySites": [],
     "ProxyIp": [],
     "BlockSites": [],
