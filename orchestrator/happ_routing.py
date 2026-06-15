@@ -26,6 +26,11 @@ import json
 # локалка и RFC1918 не заворачивались в туннель. DNS делится сам: Remote DNS
 # (Cloudflare DoH) для проксируемых ресурсов, Domestic DNS (Яндекс) для
 # direct-ресурсов — отдельной защиты от DNS-утечек не требуется.
+#
+# Категория РФ-сайтов — geosite:ru/geosite:geolocation-ru, как в официальном
+# примере обхода РФ у Happ и в их routing-билдере. Раньше тут стояло
+# geosite:category-ru (тег из geosite.dat v2fly): в предустановленной базе Happ
+# такого тега нет, правило не матчило ничего, и весь РФ-трафик уходил в туннель.
 RU_BYPASS_PROFILE: dict = {
     "Name": "RU bypass",
     "GlobalProxy": "true",
@@ -34,7 +39,7 @@ RU_BYPASS_PROFILE: dict = {
     "RemoteDNSIP": "1.1.1.1",
     "DomesticDNSType": "DoU",
     "DomesticDNSIP": "77.88.8.8",
-    "DirectSites": ["geosite:category-ru"],
+    "DirectSites": ["geosite:ru", "geosite:geolocation-ru"],
     "DirectIp": ["geoip:ru", "geoip:private"],
     "ProxySites": [],
     "ProxyIp": [],

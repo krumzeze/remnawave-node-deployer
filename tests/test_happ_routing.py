@@ -16,7 +16,7 @@ from orchestrator.happ_routing import (
 
 def test_profile_keeps_ru_direct_and_rest_proxied():
     assert RU_BYPASS_PROFILE["GlobalProxy"] == "true"
-    assert RU_BYPASS_PROFILE["DirectSites"] == ["geosite:category-ru"]
+    assert RU_BYPASS_PROFILE["DirectSites"] == ["geosite:ru", "geosite:geolocation-ru"]
     assert "geoip:ru" in RU_BYPASS_PROFILE["DirectIp"]
     assert "geoip:private" in RU_BYPASS_PROFILE["DirectIp"]
 
