@@ -138,6 +138,29 @@ def _host_inbound_uuid(host) -> str | None:
     return None
 
 
+def _unwrap_list(resp, attr: str) -> list:
+    """Достать список элементов из ответа SDK-листинга.
+
+    SDK 2.7.x отдаёт листинги (get_all_nodes/get_all_hosts) как pydantic
+    RootModel: реальный список лежит в `.root`, а сам объект — не `list`. Раньше
+    код проверял только именованный атрибут (.nodes/.hosts) и `isinstance(list)`,
+    поэтому для RootModel оба условия не срабатывали и листинг молча выходил
+    пустым. Порядок проб: именованный атрибут (на случай иной формы или тестовых
+    фейков) → `.root` → голый список → итерируемое. Иначе — пустой список."""
+    items = getattr(resp, attr, None)
+    if items is None:
+        items = getattr(resp, "root", None)
+    if items is None:
+        if isinstance(resp, list):
+            items = resp
+        else:
+            try:
+                items = list(resp)
+            except TypeError:
+                items = []
+    return items
+
+
 def _to_info(node) -> NodeInfo:
     return NodeInfo(
         uuid=str(node.uuid),
@@ -396,10 +419,7 @@ class RemnawaveClient:
             resp = await getter()
         except Exception:  # noqa: BLE001 — недоступность листинга не ломает вызывающий код
             return []
-        nodes = getattr(resp, "nodes", None)
-        if nodes is None:
-            nodes = resp if isinstance(resp, list) else []
-        return [_to_info(n) for n in nodes]
+        return [_to_info(n) for n in _unwrap_list(resp, "nodes")]
 
     async def _find_node_by_address(self, address: str) -> NodeInfo | None:
         """Найти зарегистрированную ноду по адресу, либо None.
@@ -436,9 +456,7 @@ class RemnawaveClient:
             resp = await getter()
         except Exception:  # noqa: BLE001 — недоступность листинга не ломает публикацию
             return []
-        items = getattr(resp, "hosts", None)
-        if items is None:
-            items = resp if isinstance(resp, list) else []
+        items = _unwrap_list(resp, "hosts")
         return [
             HostRef(
                 uuid=str(getattr(h, "uuid", "")),

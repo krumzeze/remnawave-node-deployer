@@ -20,6 +20,16 @@ async def _async(value):
     return value
 
 
+class _Root:
+    """Имитация pydantic RootModel из SDK 2.7.x: список в .root, объект не list."""
+
+    def __init__(self, items):
+        self.root = items
+
+    def __iter__(self):
+        return iter(self.root)
+
+
 class _FakeNode:
     """Имитация NodeResponseDto: только нужные поля."""
 
@@ -249,6 +259,19 @@ async def test_list_nodes_accepts_bare_list():
 
 
 @pytest.mark.asyncio
+async def test_list_nodes_reads_rootmodel():
+    # Боевая форма SDK 2.7.x: GetAllNodesResponseDto(RootModel) — список в .root,
+    # ни .nodes, ни isinstance(list). Раньше это молча давало пустой список.
+    resp = _Root([_FakeNode(uuid="n-r", address="4.4.4.4", is_connecting=True)])
+    nodes_attr = types.SimpleNamespace(get_all_nodes=lambda: _async(resp))
+    c = _client_with_nodes(nodes_attr)
+
+    nodes = await c.list_nodes()
+    assert [n.uuid for n in nodes] == ["n-r"]
+    assert nodes[0].status is NodeConnState.CONNECTING
+
+
+@pytest.mark.asyncio
 async def test_list_nodes_missing_method_returns_empty():
     c = _client_with_nodes(types.SimpleNamespace(create_node=None))
     assert await c.list_nodes() == []
@@ -309,6 +332,21 @@ async def test_list_hosts_reads_inbound_uuid_from_flat_field():
 
     hosts = await c.list_hosts()
     assert hosts[0].inbound_uuid == "inb-flat"
+
+
+@pytest.mark.asyncio
+async def test_list_hosts_reads_rootmodel():
+    # Боевая форма SDK 2.7.x: GetAllHostsResponseDto(RootModel) — список в .root.
+    resp = _Root([types.SimpleNamespace(
+        uuid="host-r", remark="RU", address="5.5.5.5", port=443,
+        inbound_uuid="inb-r",
+    )])
+    sdk = _FakeSDK(_FakeNode(), hosts=_FakeHosts(hosts_resp=resp))
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    hosts = await c.list_hosts()
+    assert hosts[0].uuid == "host-r"
+    assert hosts[0].inbound_uuid == "inb-r"
 
 
 @pytest.mark.asyncio
