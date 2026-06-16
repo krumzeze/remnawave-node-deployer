@@ -414,12 +414,19 @@ class RemnawaveClient:
         объект с `.nodes`, либо голый список."""
         getter = getattr(self._sdk.nodes, "get_all_nodes", None)
         if getter is None:
+            log.warning("list_nodes: у SDK нет метода get_all_nodes")
             return []
         try:
             resp = await getter()
-        except Exception:  # noqa: BLE001 — недоступность листинга не ломает вызывающий код
+        except Exception as exc:  # noqa: BLE001 — недоступность листинга не ломает вызывающий код
+            log.warning("list_nodes: get_all_nodes упал: %r", exc)
             return []
-        return [_to_info(n) for n in _unwrap_list(resp, "nodes")]
+        items = _unwrap_list(resp, "nodes")
+        log.info(
+            "list_nodes: панель вернула %d нод (resp=%s)",
+            len(items), type(resp).__name__,
+        )
+        return [_to_info(n) for n in items]
 
     async def _find_node_by_address(self, address: str) -> NodeInfo | None:
         """Найти зарегистрированную ноду по адресу, либо None.
