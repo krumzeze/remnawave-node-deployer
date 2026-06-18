@@ -30,7 +30,7 @@ from arq.connections import ArqRedis, RedisSettings
 
 from bot import keyboards
 from bot.callbacks import MenuCB, NodeCB, PanelCB, WizCB
-from bot.states import AddNode, SetPanel
+from bot.states import AddNode, AdoptNode, SetPanel
 from config import settings
 from orchestrator import domain
 from orchestrator.ssh_bootstrap import _generate_keypair
@@ -545,7 +545,10 @@ async def node_open(query: CallbackQuery, callback_data: NodeCB) -> None:
     if node is None:
         await query.answer("Нода не найдена.", show_alert=True)
         return
-    await _render(query, _node_detail_text(node), keyboards.node_actions(node.id))
+    await _render(
+        query, _node_detail_text(node),
+        keyboards.node_actions(node.id, has_ssh=node.ssh_key_vault_path is not None),
+    )
     await query.answer()
 
 
@@ -560,7 +563,10 @@ async def node_refresh(query: CallbackQuery, callback_data: NodeCB) -> None:
         await query.answer("Нода не найдена.", show_alert=True)
         return
     live = await _live_status(owner, node)
-    await _render(query, _node_detail_text(node, live), keyboards.node_actions(node.id))
+    await _render(
+        query, _node_detail_text(node, live),
+        keyboards.node_actions(node.id, has_ssh=node.ssh_key_vault_path is not None),
+    )
     await query.answer("Обновлено")
 
 
@@ -591,6 +597,123 @@ async def node_delete(query: CallbackQuery, callback_data: NodeCB) -> None:
         text += "\n\nПока нет добавленных нод."
     await _render(query, text, keyboards.nodes_list(nodes))
     await query.answer()
+
+
+# --------------------------------------------------------------------------
+# Удочерение импортированной ноды: дать ей SSH-доступ (ADR 0013).
+# --------------------------------------------------------------------------
+async def _adopt_node(
+    node_id: int, ip: str, login: str, password: str
+) -> tuple[bool, str]:
+    """Поставить наш ключ на сервер импортированной ноды и сохранить доступ.
+
+    Переиспользуем bootstrap по паролю (детекция окружения + установка ключа +
+    проверка входа по нему), кладём приватный ключ в Vault по тому же пути, что и
+    при обычном провижене (nodes/{id}/ssh), и пишем путь в БД. После этого нода
+    становится полноценной: действия по SSH начинают работать. Пароль приходит
+    параметром, используется один раз и не сохраняется."""
+    from db import get_sessionmaker
+    from db.repo import set_node_fields
+    from orchestrator import ssh_bootstrap
+    from secretstore.vault import VaultStore
+
+    result = await ssh_bootstrap.bootstrap_password(ip, login, password)
+    if not result.ok or not result.private_key:
+        return False, result.detail or "не удалось подключиться к серверу"
+
+    key_path = f"nodes/{node_id}/ssh"
+    try:
+        VaultStore().put(key_path, {"private_key": result.private_key})
+    except Exception as exc:  # noqa: BLE001 — без сохранённого ключа доступа нет смысла
+        logger.warning("удочерение: ключ получен, но не сохранён в Vault: %s", exc)
+        return False, f"ключ получен, но не сохранён в Vault: {exc}"
+
+    await set_node_fields(
+        get_sessionmaker(), node_id, ssh_key_vault_path=key_path
+    )
+    return True, "Готово: ключ установлен, нодой теперь можно управлять."
+
+
+@router.callback_query(NodeCB.filter(F.action == "adopt"))
+async def node_adopt_start(
+    query: CallbackQuery, callback_data: NodeCB, state: FSMContext
+) -> None:
+    from db import get_sessionmaker
+    from db.repo import get_node_for_owner
+
+    node = await get_node_for_owner(
+        get_sessionmaker(), callback_data.node_id, _owner_of(query)
+    )
+    if node is None:
+        await query.answer("Нода не найдена.", show_alert=True)
+        return
+    if node.ssh_key_vault_path:
+        await query.answer("У ноды уже есть SSH-доступ.", show_alert=True)
+        return
+    await state.set_state(AdoptNode.wait_login)
+    await state.update_data(adopt_node_id=node.id, adopt_ip=node.ip)
+    await _render(
+        query,
+        f"Удочерение ноды {node.ip}.\n"
+        "Пришли логин для входа на сервер (обычно root):",
+        keyboards.cancel_only(),
+    )
+    await query.answer()
+
+
+@router.message(AdoptNode.wait_login)
+async def node_adopt_login(message: Message, state: FSMContext) -> None:
+    login = (message.text or "").strip()
+    if not login:
+        await message.answer(
+            "Пустой логин. Пришли логин (например, root).",
+            reply_markup=keyboards.cancel_only(),
+        )
+        return
+    await state.update_data(adopt_login=login)
+    await state.set_state(AdoptNode.wait_password)
+    await message.answer(
+        "Пришли пароль для входа. Он используется один раз, чтобы поставить "
+        "ключ, и нигде не сохраняется.",
+        reply_markup=keyboards.cancel_only(),
+    )
+
+
+@router.message(AdoptNode.wait_password)
+async def node_adopt_password(message: Message, state: FSMContext) -> None:
+    # Пароль не логируем и держим только до постановки ключа (как wiz_password).
+    password = message.text or ""
+    data = await state.get_data()
+    await state.clear()
+    node_id = data.get("adopt_node_id")
+    ip = data.get("adopt_ip")
+    login = data.get("adopt_login")
+
+    owner = _owner_of(message)
+    from db import get_sessionmaker
+    from db.repo import get_node_for_owner
+
+    node = await get_node_for_owner(get_sessionmaker(), node_id, owner)
+    if node is None:
+        await message.answer("Нода не найдена.", reply_markup=keyboards.main_menu())
+        return
+
+    await message.answer(f"Подключаюсь к {ip} и ставлю ключ — это займёт минуту…")
+    try:
+        ok, detail = await _adopt_node(node_id, ip, login, password)
+    except Exception as exc:  # noqa: BLE001 — сбой удочерения не должен ронять бот
+        logger.warning("удочерение ноды %s упало: %s", node_id, exc)
+        ok, detail = False, f"непредвиденный сбой: {exc}"
+    finally:
+        del password
+
+    node = await get_node_for_owner(get_sessionmaker(), node_id, owner)
+    await message.answer(
+        detail,
+        reply_markup=keyboards.node_actions(
+            node_id, has_ssh=bool(node and node.ssh_key_vault_path)
+        ),
+    )
 
 
 # --------------------------------------------------------------------------

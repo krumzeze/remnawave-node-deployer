@@ -69,9 +69,15 @@ def nodes_list(nodes) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def node_actions(node_id: int) -> InlineKeyboardMarkup:
+def node_actions(node_id: int, *, has_ssh: bool = True) -> InlineKeyboardMarkup:
+    """Кнопки экрана одной ноды.
+
+    has_ssh=False (импортированная нода без SSH-ключа) — показываем «Удочерить»:
+    она даёт ноде SSH-доступ, после чего ей можно управлять (ADR 0013)."""
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить статус", callback_data=NodeCB(action="refresh", node_id=node_id))
+    if not has_ssh:
+        b.button(text="🤝 Удочерить (дать SSH-доступ)", callback_data=NodeCB(action="adopt", node_id=node_id))
     b.button(text="🗑 Убрать ноду", callback_data=NodeCB(action="ask_delete", node_id=node_id))
     b.button(text="⬅️ К списку", callback_data=MenuCB(action="nodes"))
     b.adjust(1)

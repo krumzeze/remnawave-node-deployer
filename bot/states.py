@@ -51,6 +51,17 @@ class AddNode(StatesGroup):
     confirm = State()
 
 
+class AdoptNode(StatesGroup):
+    """Удочерение импортированной ноды (ADR 0013).
+
+    Импортированные синком ноды без SSH-ключа (ssh_key_vault_path = NULL) видны,
+    но ими нельзя управлять. Удочерение даёт им SSH-доступ: оператор вводит
+    логин и пароль сервера, мы ставим свой ключ (переиспользуя bootstrap по
+    паролю) и кладём его в Vault. Пароль используется один раз и не хранится."""
+    wait_login = State()
+    wait_password = State()
+
+
 class SetPanel(StatesGroup):
     """Привязка/смена сохранённой панели (раздел «Панель» в меню).
 

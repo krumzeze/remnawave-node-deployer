@@ -51,6 +51,20 @@ def test_nodes_list_has_sync_button():
     assert "sync" in actions
 
 
+def test_node_actions_shows_adopt_only_without_ssh():
+    # Импортированная нода (нет SSH-ключа) — есть кнопка «Удочерить»;
+    # у полноценной её нет.
+    def adopt_actions(markup):
+        return [
+            NodeCB.unpack(b.callback_data).action
+            for b in _all_buttons(markup)
+            if b.callback_data.startswith("n:")
+        ]
+
+    assert "adopt" in adopt_actions(keyboards.node_actions(1, has_ssh=False))
+    assert "adopt" not in adopt_actions(keyboards.node_actions(1, has_ssh=True))
+
+
 def test_main_menu_has_three_actions():
     actions = []
     for btn in _all_buttons(keyboards.main_menu()):

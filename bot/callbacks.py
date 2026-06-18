@@ -17,7 +17,7 @@ class MenuCB(CallbackData, prefix="m"):
 
 class NodeCB(CallbackData, prefix="n"):
     """Действия над конкретной нодой из списка «Мои ноды»."""
-    action: str  # open | refresh | ask_delete | delete
+    action: str  # open | refresh | adopt | ask_delete | delete
     node_id: int
 
 
