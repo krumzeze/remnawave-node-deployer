@@ -59,9 +59,13 @@ if [ ! -s "$INIT_FILE" ]; then
   exit 1
 fi
 
-UNSEAL_KEY=$(grep -o '"unseal_keys_b64":\[[^]]*\]' "$INIT_FILE" \
-  | grep -o '"[A-Za-z0-9+/=]\{10,\}"' | head -n1 | tr -d '"')
-ROOT_TOKEN=$(grep -o '"root_token":"[^"]*"' "$INIT_FILE" | sed 's/.*:"//; s/"$//')
+# vault operator init -format=json выводит отформатированный многострочный JSON
+# (пробелы после двоеточий, массив на нескольких строках). Поэтому сначала
+# схлопываем все пробелы и переводы строк, а потом достаём значения — иначе
+# построчный grep ничего не находит и ключ выходит пустым.
+JSON=$(tr -d ' \t\r\n' < "$INIT_FILE")
+UNSEAL_KEY=$(printf '%s' "$JSON" | sed -n 's/.*"unseal_keys_b64":\["\([^"]*\)".*/\1/p')
+ROOT_TOKEN=$(printf '%s' "$JSON" | sed -n 's/.*"root_token":"\([^"]*\)".*/\1/p')
 
 if [ -z "$UNSEAL_KEY" ] || [ -z "$ROOT_TOKEN" ]; then
   echo "vault: FATAL — не удалось разобрать unseal-ключ или root-токен из $INIT_FILE" >&2
