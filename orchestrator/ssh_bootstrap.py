@@ -175,37 +175,15 @@ async def _install_and_verify_key(
     return True, "Вход по ключу подтверждён."
 
 
-async def _disable_password_auth(conn: asyncssh.SSHClientConnection) -> tuple[bool, str]:
-    """Необратимый шаг: выключает парольную аутентификацию в sshd и перезапускает его.
-
-    Вызывается ТОЛЬКО после успешной проверки входа по ключу.
-    """
-    cmd = (
-        "set -e; "
-        "f=/etc/ssh/sshd_config; "
-        r"sed -ri 's/^#?\s*PasswordAuthentication\s+.*/PasswordAuthentication no/' $f; "
-        "grep -qi '^PasswordAuthentication no' $f "
-        "|| echo 'PasswordAuthentication no' >> $f; "
-        # На свежих Ubuntu значение может переопределяться в cloud-init drop-in.
-        "if [ -d /etc/ssh/sshd_config.d ]; then "
-        "  echo 'PasswordAuthentication no' > /etc/ssh/sshd_config.d/99-no-password.conf; "
-        "fi; "
-        "sshd -t; "  # проверка конфига до рестарта, чтобы не убить демон
-        "systemctl restart ssh 2>/dev/null || systemctl restart sshd"
-    )
-    res = await conn.run(cmd, check=False)
-    if res.exit_status != 0:
-        return False, f"Не удалось отключить парольный вход: {res.stderr}"
-    return True, "Парольный вход отключён."
-
-
 async def bootstrap_password(
     host: str, login: str, password: str, *, port: int = 22
 ) -> BootstrapResult:
-    """Ветка «пароль»: подключиться, выложить ключ, проверить, отключить пароль.
+    """Ветка «пароль»: подключиться, выложить ключ, проверить вход по нему.
 
-    Порядок строго по ADR 0002. Пароль используется один раз и удаляется из
-    памяти в конце; в результат он не попадает.
+    По решению оператора (ADR 0002) парольный вход на сервере НЕ отключаем —
+    деплойер лишь добавляет свой ключ для безпарольной работы, а жёсткий
+    hardening доступа остаётся заботой владельца сервера. Пароль используется
+    один раз и удаляется из памяти в конце; в результат он не попадает.
     """
     # 1. Детекция и отбраковка ДО изменений.
     ok, env, reason = await detect_environment(
@@ -233,11 +211,6 @@ async def bootstrap_password(
             if not ok:
                 # Откат не нужен: пароль ещё работает, ключ просто лишний.
                 return BootstrapResult(ok=False, detail=detail)
-
-            # 4. Только теперь — необратимое отключение пароля.
-            ok, detail = await _disable_password_auth(conn)
-            if not ok:
-                return BootstrapResult(ok=False, detail=detail)
     except (OSError, asyncssh.Error) as exc:
         return BootstrapResult(ok=False, detail=f"Сбой bootstrap: {exc}")
     finally:
@@ -246,7 +219,7 @@ async def bootstrap_password(
         del password
 
     return BootstrapResult(
-        ok=True, private_key=private_key, detail="Сервер переведён на вход по ключу."
+        ok=True, private_key=private_key, detail="Ключ добавлен, вход по ключу работает."
     )
 
 
