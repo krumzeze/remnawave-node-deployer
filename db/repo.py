@@ -158,6 +158,49 @@ async def set_node_fields(
         await session.commit()
 
 
+async def list_panels(session_factory: async_sessionmaker) -> list[Panel]:
+    """Все панели — для фонового поллера статуса (ADR 0013).
+
+    Поллер обходит панели, по каждой читает токен из Vault и опрашивает её
+    ноды. Single-tenant (ADR 0003), панелей обычно одна-две."""
+    async with session_factory() as session:
+        rows = await session.scalars(select(Panel))
+        return list(rows.all())
+
+
+async def list_monitored_nodes(
+    session_factory: async_sessionmaker, panel_id: int
+) -> list[Node]:
+    """Ноды панели, зарегистрированные в ней (есть remnawave_uuid).
+
+    Только их и опрашивает поллер: без uuid статус в панели не получить
+    (нода ещё в провижине либо его не прошла)."""
+    async with session_factory() as session:
+        rows = await session.scalars(
+            select(Node).where(
+                Node.panel_id == panel_id,
+                Node.remnawave_uuid.is_not(None),
+            )
+        )
+        return list(rows.all())
+
+
+async def set_node_state(
+    session_factory: async_sessionmaker, node_id: int, state: str
+) -> None:
+    """Обновить только Node.state, без строки Task в истории.
+
+    Для поллера: он пишет живой статус каждые ~5 минут, и заводить на каждый
+    опрос запись Task значило бы засорять аудит ноды. Пишем, только если статус
+    изменился, чтобы не дёргать БД впустую. Нет ноды — молча выходим."""
+    async with session_factory() as session:
+        node = await session.get(Node, node_id)
+        if node is None or node.state == state:
+            return
+        node.state = state
+        await session.commit()
+
+
 async def record_status(
     session_factory: async_sessionmaker,
     node_id: int,

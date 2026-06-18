@@ -455,7 +455,17 @@ async def _live_status(owner: int, node) -> str | None:
     except Exception as exc:  # noqa: BLE001 — статус не должен ронять экран
         logger.warning("не удалось получить статус ноды из панели: %s", exc)
         return None
-    return getattr(status, "value", str(status))
+    value = getattr(status, "value", str(status))
+    # Освежаем Node.state в БД, чтобы список «Мои ноды» не показывал протухший
+    # статус до следующего прохода фонового поллера (ADR 0013).
+    try:
+        from db import get_sessionmaker
+        from db.repo import set_node_state
+
+        await set_node_state(get_sessionmaker(), node.id, value)
+    except Exception as exc:  # noqa: BLE001 — запись статуса не должна ронять экран
+        logger.warning("не удалось сохранить статус ноды в БД: %s", exc)
+    return value
 
 
 @router.callback_query(MenuCB.filter(F.action == "nodes"))

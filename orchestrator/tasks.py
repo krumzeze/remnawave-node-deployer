@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from config import settings
@@ -24,6 +25,7 @@ from orchestrator import (
     ansible_runner,
     domain,
     local_compose,
+    monitor,
     panel_setup,
     panel_stack,
     reporting,
@@ -1082,6 +1084,15 @@ class WorkerSettings:
     """Конфиг arq-воркера: какие задачи обслуживаем и хуки жизненного цикла."""
 
     functions = [provision_node, provision_panel]
+    # Фоновый поллер статуса нод (ADR 0013): каждые POLL_EVERY_MINUTES минут.
+    # ctx воркера переживает запуски cron — в нём монитор держит счётчики offline.
+    cron_jobs = [
+        cron(
+            monitor.poll_node_statuses,
+            minute=set(range(0, 60, monitor.POLL_EVERY_MINUTES)),
+            run_at_startup=False,
+        )
+    ]
     on_startup = _worker_startup
     on_shutdown = _worker_shutdown
     redis_settings = RedisSettings(host=settings.redis_host,
