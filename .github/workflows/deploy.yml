@@ -33,4 +33,10 @@ jobs:
             git fetch --prune origin
             git reset --hard origin/main
             docker compose up -d --build
+            # entrypoint.sh/конфиг vault примонтированы как отдельные файлы, а
+            # git reset --hard заменяет их новым inode. up -d не пересоздаёт vault,
+            # поэтому контейнер держит старый inode и крутит прежний скрипт.
+            # Форсим пересоздание, чтобы правки vault применялись сами. Тома
+            # (vaultdata и пр.) при этом не трогаются — секреты сохраняются.
+            docker compose up -d --force-recreate vault
             docker image prune -f
