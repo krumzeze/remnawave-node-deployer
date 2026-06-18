@@ -30,16 +30,43 @@ while true; do
   sleep 1
 done
 
+# Инициализацию определяем по реальному состоянию Vault, а не по наличию файла:
+# init -status даёт 0 (инициализирован) или 2 (нет). Опираться на файл нельзя —
+# пустой/битый init.json от неудачного первого старта раньше приводил к пустому
+# ключу и распечатке «с терминала» (file descriptor 0 is not a terminal).
+if vault operator init -status >/dev/null 2>&1; then
+  INITIALIZED=1
+else
+  INITIALIZED=0
+fi
+
 # Первый запуск — инициализация (1 доля ключа, порог 1: оператор один).
-if [ ! -f "$INIT_FILE" ]; then
-  vault operator init -key-shares=1 -key-threshold=1 -format=json > "$INIT_FILE"
+# Пишем через временный файл и mv: при сбое init.json не остаётся обрезанным.
+if [ "$INITIALIZED" = "0" ]; then
+  TMP="${INIT_FILE}.tmp"
+  vault operator init -key-shares=1 -key-threshold=1 -format=json > "$TMP"
+  mv "$TMP" "$INIT_FILE"
   chmod 600 "$INIT_FILE"
   echo "vault: initialised, keys saved to $INIT_FILE"
+fi
+
+# Vault инициализирован, но ключей нет (пустой/потерянный init.json) — распечатать
+# нечем. Падаем с понятным сообщением вместо чтения ключа со stdin.
+if [ ! -s "$INIT_FILE" ]; then
+  echo "vault: FATAL — Vault инициализирован, но $INIT_FILE пуст или отсутствует;" \
+       "unseal-ключ потерян. Восстановление: остановить стек и удалить том vaultdata" \
+       "(секреты в нём будут потеряны), затем развернуть заново." >&2
+  exit 1
 fi
 
 UNSEAL_KEY=$(grep -o '"unseal_keys_b64":\[[^]]*\]' "$INIT_FILE" \
   | grep -o '"[A-Za-z0-9+/=]\{10,\}"' | head -n1 | tr -d '"')
 ROOT_TOKEN=$(grep -o '"root_token":"[^"]*"' "$INIT_FILE" | sed 's/.*:"//; s/"$//')
+
+if [ -z "$UNSEAL_KEY" ] || [ -z "$ROOT_TOKEN" ]; then
+  echo "vault: FATAL — не удалось разобрать unseal-ключ или root-токен из $INIT_FILE" >&2
+  exit 1
+fi
 
 # Распечатываем при каждом старте (после рестарта Vault снова запечатан).
 if vault status 2>/dev/null | grep -q "Sealed.*true"; then
