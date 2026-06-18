@@ -61,8 +61,13 @@ def test_node_actions_shows_adopt_only_without_ssh():
             if b.callback_data.startswith("n:")
         ]
 
-    assert "adopt" in adopt_actions(keyboards.node_actions(1, has_ssh=False))
-    assert "adopt" not in adopt_actions(keyboards.node_actions(1, has_ssh=True))
+    without = adopt_actions(keyboards.node_actions(1, has_ssh=False))
+    withssh = adopt_actions(keyboards.node_actions(1, has_ssh=True))
+    assert "adopt" in without
+    assert "restart" not in without and "ask_reboot" not in without
+    # С SSH-доступом — управление, без удочерения.
+    assert "adopt" not in withssh
+    assert "restart" in withssh and "ask_reboot" in withssh
 
 
 def test_main_menu_has_three_actions():

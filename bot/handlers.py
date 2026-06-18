@@ -623,7 +623,10 @@ async def _adopt_node(
 
     key_path = f"nodes/{node_id}/ssh"
     try:
-        VaultStore().put(key_path, {"private_key": result.private_key})
+        # Логин кладём рядом с ключом — он нужен поздним SSH-действиям (ADR 0013).
+        VaultStore().put(
+            key_path, {"private_key": result.private_key, "login": login}
+        )
     except Exception as exc:  # noqa: BLE001 — без сохранённого ключа доступа нет смысла
         logger.warning("удочерение: ключ получен, но не сохранён в Vault: %s", exc)
         return False, f"ключ получен, но не сохранён в Vault: {exc}"
@@ -714,6 +717,88 @@ async def node_adopt_password(message: Message, state: FSMContext) -> None:
             node_id, has_ssh=bool(node and node.ssh_key_vault_path)
         ),
     )
+
+
+# --------------------------------------------------------------------------
+# Действия по SSH над развёрнутой нодой: перезапуск / ребут (ADR 0013).
+# --------------------------------------------------------------------------
+def _load_node_key(vault_path: str) -> tuple[str, str] | None:
+    """Достать (private_key, login) ноды из Vault по её пути ключа.
+
+    Логин лежит рядом с ключом (см. _store_key/_adopt_node); у старых нод его
+    может не быть — тогда дефолтим на root (типовой логин VPS). None — если
+    ключа нет или Vault недоступен."""
+    from secretstore.vault import VaultStore
+
+    try:
+        data = VaultStore().get(vault_path) or {}
+    except Exception as exc:  # noqa: BLE001 — нет ключа/Vault недоступен
+        logger.warning("не удалось прочитать ключ ноды из Vault: %s", exc)
+        return None
+    key = data.get("private_key")
+    if not key:
+        return None
+    return key, data.get("login") or "root"
+
+
+async def _ssh_node(query: CallbackQuery, node_id: int, action) -> None:
+    """Общий каркас SSH-действия: проверить владельца/ключ, выполнить, отчитаться.
+
+    action — корутина (ip, login, private_key) -> OpResult (restart/reboot)."""
+    from db import get_sessionmaker
+    from db.repo import get_node_for_owner
+
+    owner = _owner_of(query)
+    node = await get_node_for_owner(get_sessionmaker(), node_id, owner)
+    if node is None:
+        await query.answer("Нода не найдена.", show_alert=True)
+        return
+    if not node.ssh_key_vault_path:
+        await query.answer("У ноды нет SSH-доступа. Сначала удочери её.", show_alert=True)
+        return
+    creds = _load_node_key(node.ssh_key_vault_path)
+    if creds is None:
+        await query.answer("Не удалось прочитать SSH-ключ ноды из Vault.", show_alert=True)
+        return
+    private_key, login = creds
+
+    await query.answer("Выполняю…")
+    try:
+        result = await action(node.ip, login, private_key)
+        detail = result.detail
+    except Exception as exc:  # noqa: BLE001 — сбой действия не должен ронять бот
+        logger.warning("SSH-действие над нодой %s упало: %s", node_id, exc)
+        detail = f"Непредвиденный сбой: {exc}"
+    await _render(
+        query, detail,
+        keyboards.node_actions(node_id, has_ssh=True),
+    )
+
+
+@router.callback_query(NodeCB.filter(F.action == "restart"))
+async def node_restart(query: CallbackQuery, callback_data: NodeCB) -> None:
+    from orchestrator import node_ops
+
+    await _ssh_node(query, callback_data.node_id, node_ops.restart_node)
+
+
+@router.callback_query(NodeCB.filter(F.action == "ask_reboot"))
+async def node_ask_reboot(query: CallbackQuery, callback_data: NodeCB) -> None:
+    await _render(
+        query,
+        "Перезагрузить сервер ноды целиком?\n"
+        "Нода ненадолго пропадёт и вернётся сама через пару минут. Имеет смысл, "
+        "когда забита память и перезапуск контейнера не помогает.",
+        keyboards.node_reboot_confirm(callback_data.node_id),
+    )
+    await query.answer()
+
+
+@router.callback_query(NodeCB.filter(F.action == "reboot"))
+async def node_reboot(query: CallbackQuery, callback_data: NodeCB) -> None:
+    from orchestrator import node_ops
+
+    await _ssh_node(query, callback_data.node_id, node_ops.reboot_server)
 
 
 # --------------------------------------------------------------------------

@@ -63,8 +63,10 @@ async def test_adopt_installs_key_and_persists_path(sm, monkeypatch):
     ok, detail = await handlers._adopt_node(node.id, "1.2.3.4", "root", "pw")
     assert ok, detail
 
-    # Ключ ушёл в Vault по каноничному пути, путь записан в БД.
-    assert FakeVault.store == {f"nodes/{node.id}/ssh": {"private_key": "PRIV"}}
+    # Ключ и логин ушли в Vault по каноничному пути, путь записан в БД.
+    assert FakeVault.store == {
+        f"nodes/{node.id}/ssh": {"private_key": "PRIV", "login": "root"}
+    }
     async with sm() as session:
         refreshed = await session.get(Node, node.id)
         assert refreshed.ssh_key_vault_path == f"nodes/{node.id}/ssh"

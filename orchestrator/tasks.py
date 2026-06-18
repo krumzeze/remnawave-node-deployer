@@ -364,11 +364,17 @@ class _Pipeline:
         """Положить приватный ключ в Vault по пути ноды (node_id). В БД пишется
         только путь (vault_path), сам ключ — никогда (см. db/models.py, секреты
         только в Vault). Если путь не определить (нет ни node_id, ни ip) — store
-        пропускаем, ронять провижн из-за этого не стоит."""
+        пропускаем, ронять провижн из-за этого не стоит.
+
+        Рядом с ключом кладём логин SSH: он нужен поздним действиям по ключу
+        (перезапуск/ребут, ADR 0013), а в модели Node его нет (миграций в проекте
+        нет). Для старых нод без логина в Vault читатель дефолтит на root."""
         path = self._key_vault_path()
         if self.deps.vault_put is None or path is None:
             return
-        self.deps.vault_put(path, {"private_key": private_key})
+        self.deps.vault_put(
+            path, {"private_key": private_key, "login": self.p.get("login", "root")}
+        )
 
     async def _persist_node(
         self, *, remnawave_uuid: str | None = None,

@@ -76,10 +76,22 @@ def node_actions(node_id: int, *, has_ssh: bool = True) -> InlineKeyboardMarkup:
     она даёт ноде SSH-доступ, после чего ей можно управлять (ADR 0013)."""
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить статус", callback_data=NodeCB(action="refresh", node_id=node_id))
-    if not has_ssh:
+    if has_ssh:
+        # Управление по SSH-ключу (ADR 0013): лёгкий рестарт и тяжёлый ребут.
+        b.button(text="♻️ Перезапустить ноду", callback_data=NodeCB(action="restart", node_id=node_id))
+        b.button(text="🔁 Перезагрузить сервер", callback_data=NodeCB(action="ask_reboot", node_id=node_id))
+    else:
         b.button(text="🤝 Удочерить (дать SSH-доступ)", callback_data=NodeCB(action="adopt", node_id=node_id))
     b.button(text="🗑 Убрать ноду", callback_data=NodeCB(action="ask_delete", node_id=node_id))
     b.button(text="⬅️ К списку", callback_data=MenuCB(action="nodes"))
+    b.adjust(1)
+    return b.as_markup()
+
+
+def node_reboot_confirm(node_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ Да, перезагрузить сервер", callback_data=NodeCB(action="reboot", node_id=node_id))
+    b.button(text="↩️ Отмена", callback_data=NodeCB(action="open", node_id=node_id))
     b.adjust(1)
     return b.as_markup()
 

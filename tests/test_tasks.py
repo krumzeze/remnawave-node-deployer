@@ -394,7 +394,8 @@ async def test_vault_put_uses_node_id_path_not_ip():
     deps = _deps(client=client, reports=reports, vault_put=vault_put)
     await tasks.provision_node({"deps": deps}, _payload())
 
-    assert stored == {"nodes/1/ssh": {"private_key": "PRIVKEY"}}
+    # Рядом с ключом кладётся логин SSH (для поздних действий, ADR 0013).
+    assert stored == {"nodes/1/ssh": {"private_key": "PRIVKEY", "login": "root"}}
 
 
 @pytest.mark.asyncio
