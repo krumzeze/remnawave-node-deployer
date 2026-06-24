@@ -15,6 +15,8 @@ from orchestrator.xray_config import (
     DEFAULT_REALITY_DEST,
     InboundChoice,
     REALITY_CHOICES,
+    available_choices_for_node,
+    base_choice_from_tag,
     build_profile,
     generate_reality_keys,
 )
@@ -271,6 +273,45 @@ def test_hysteria2_port_marked_udp():
     )
     port = prof.ports["hysteria2"]
     assert port in prof.udp_ports, "Hysteria2 (QUIC) должен открываться по UDP"
+
+
+def test_base_choice_from_tag():
+    # Голый тег и тег с per-node суффиксом распознаются в один и тот же пункт.
+    assert base_choice_from_tag("shadowsocks") is InboundChoice.SHADOWSOCKS
+    assert (base_choice_from_tag("vless-reality-tcp-1-2-3-4")
+            is InboundChoice.VLESS_REALITY_TCP)
+    assert base_choice_from_tag("hysteria2-94-125-103-122") is InboundChoice.HYSTERIA2
+    assert base_choice_from_tag("unknown-tag") is None
+    assert base_choice_from_tag("") is None
+
+
+def test_available_choices_excludes_present():
+    # На ноде уже есть reality-tcp и shadowsocks — их в списке добавляемых нет.
+    existing = ["vless-reality-tcp-1-2-3-4", "shadowsocks-1-2-3-4"]
+    avail = available_choices_for_node(existing, has_domain=False)
+    assert InboundChoice.VLESS_REALITY_TCP not in avail
+    assert InboundChoice.SHADOWSOCKS not in avail
+    # Domain-free reality-варианты доступны.
+    assert InboundChoice.VLESS_XHTTP_REALITY in avail
+    assert InboundChoice.VLESS_GRPC_REALITY in avail
+
+
+def test_available_choices_hide_domain_inbounds_without_domain():
+    # Без домена доменные инбаунды (TLS/Hysteria2) не предлагаем.
+    avail = available_choices_for_node([], has_domain=False)
+    assert InboundChoice.HYSTERIA2 not in avail
+    assert InboundChoice.VLESS_XHTTP_TLS not in avail
+    assert InboundChoice.TROJAN_WS_TLS not in avail
+
+
+def test_available_choices_offer_domain_inbounds_when_domain_present():
+    # У ноды есть доменный инбаунд (значит сертификат выпущен) — Hysteria2 можно.
+    existing = ["vless-xhttp-tls-1-2-3-4"]
+    avail = available_choices_for_node(existing, has_domain=True)
+    assert InboundChoice.HYSTERIA2 in avail
+    assert InboundChoice.TROJAN_WS_TLS in avail
+    # Уже стоящий tls-xhttp повторно не предлагаем.
+    assert InboundChoice.VLESS_XHTTP_TLS not in avail
 
 
 def test_host_hints_hysteria2_tls_no_fingerprint():

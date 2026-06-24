@@ -82,6 +82,49 @@ PORT_443 = 443
 FALLBACK_PORTS = (8443, 8444, 2053, 2083, 2087, 2096)
 
 
+def base_choice_from_tag(tag: str) -> InboundChoice | None:
+    """Вытащить пункт меню из тега инбаунда профиля, либо None.
+
+    Теги в профиле — это `<choice.value>` с per-node суффиксом (`vless-reality-
+    tcp-1-2-3-4`), а у простых случаев — голый `choice.value`. Сопоставляем по
+    точному совпадению или префиксу `value-`. Берём самое длинное совпадение,
+    чтобы значения-префиксы не путались между собой (на случай будущих пунктов).
+    """
+    if not tag:
+        return None
+    best: InboundChoice | None = None
+    for choice in InboundChoice:
+        v = choice.value
+        if tag == v or tag.startswith(v + "-"):
+            if best is None or len(v) > len(best.value):
+                best = choice
+    return best
+
+
+def available_choices_for_node(
+    existing_tags: list[str], *, has_domain: bool
+) -> list[InboundChoice]:
+    """Какие инбаунды можно добавить к уже развёрнутой ноде.
+
+    Отсеиваем: (1) те, что на ноде уже есть (по базовому тегу — повторno тот же
+    инбаунд не заводим), (2) доменные (TLS/Hysteria2), если у ноды нет домена с
+    сертификатом — без него такой инбаунд не поднять. has_domain выводится выше
+    по стеку из того, есть ли среди существующих тегов хоть один доменный (тогда
+    сертификат на ноде уже выпущен). Порядок — как в InboundChoice (стабильный
+    для UI)."""
+    present = {
+        c for c in (base_choice_from_tag(t) for t in existing_tags) if c is not None
+    }
+    out: list[InboundChoice] = []
+    for choice in InboundChoice:
+        if choice in present:
+            continue
+        if choice in TLS_CHOICES and not has_domain:
+            continue
+        out.append(choice)
+    return out
+
+
 def _b64url_nopad(raw: bytes) -> str:
     """base64url без выравнивания — формат ключей, как у Xray (`x25519`)."""
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
