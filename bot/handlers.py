@@ -494,7 +494,12 @@ async def menu_nodes_sync(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     owner = _owner_of(query)
     from db import get_sessionmaker
-    from db.repo import get_saved_panel, import_panel_node, list_nodes_for_owner
+    from db.repo import (
+        get_saved_panel,
+        import_panel_node,
+        list_nodes_for_owner,
+        set_node_state_by_uuid,
+    )
 
     sm = get_sessionmaker()
     panel = await get_saved_panel(sm, owner)
@@ -515,12 +520,20 @@ async def menu_nodes_sync(query: CallbackQuery, state: FSMContext) -> None:
         return
 
     created = 0
+    refreshed = 0
     for n in panel_nodes:
         if await import_panel_node(
             sm, panel_id=panel.id, remnawave_uuid=n.uuid, ip=n.address,
             state=n.status.value,
         ):
             created += 1
+        # Нода уже была в списке — освежаем её статус из панели (живой статус
+        # пришёл в том же ответе list_nodes). Так одна кнопка обновляет статусы
+        # всех нод, не заходя в каждую по отдельности.
+        elif await set_node_state_by_uuid(
+            sm, panel_id=panel.id, remnawave_uuid=n.uuid, state=n.status.value,
+        ):
+            refreshed += 1
 
     nodes = await list_nodes_for_owner(sm, owner)
     if created:
@@ -529,6 +542,8 @@ async def menu_nodes_sync(query: CallbackQuery, state: FSMContext) -> None:
         head = "Новых нод нет — всё уже в списке."
     else:
         head = "В панели нет нод для импорта."
+    if refreshed:
+        head += f" Обновлены статусы: {refreshed}."
     text = f"{head}\n\nТвои ноды:" if nodes else head
     await _render(query, text, keyboards.nodes_list(nodes))
     await query.answer()

@@ -66,6 +66,36 @@ async def test_import_panel_node_creates_then_dedups(sm):
 
 
 @pytest.mark.asyncio
+async def test_set_node_state_by_uuid_updates_existing(sm):
+    # Синк освежает статус уже импортированной ноды по (panel_id, uuid).
+    panel_id = await repo.get_or_create_panel(
+        sm, owner_tg_id=1, url="https://p", token_vault_path="t"
+    )
+    await repo.import_panel_node(
+        sm, panel_id=panel_id, remnawave_uuid="rw-1", ip="1.2.3.4", state="online"
+    )
+
+    changed = await repo.set_node_state_by_uuid(
+        sm, panel_id=panel_id, remnawave_uuid="rw-1", state="offline"
+    )
+    assert changed is True
+    nodes = await repo.list_nodes_for_owner(sm, owner_tg_id=1)
+    assert nodes[0].state == "offline"
+
+    # Тот же статус — не пишем, возвращаем False.
+    again = await repo.set_node_state_by_uuid(
+        sm, panel_id=panel_id, remnawave_uuid="rw-1", state="offline"
+    )
+    assert again is False
+
+    # Неизвестный uuid — тоже False, без ошибки.
+    missing = await repo.set_node_state_by_uuid(
+        sm, panel_id=panel_id, remnawave_uuid="nope", state="online"
+    )
+    assert missing is False
+
+
+@pytest.mark.asyncio
 async def test_import_panel_node_skips_bot_node_with_same_uuid(sm):
     # Ботовая нода с проставленным uuid не должна задваиваться при синке.
     panel_id = await repo.get_or_create_panel(

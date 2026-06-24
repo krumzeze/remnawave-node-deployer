@@ -131,6 +131,35 @@ async def import_panel_node(
         return True
 
 
+async def set_node_state_by_uuid(
+    session_factory: async_sessionmaker,
+    *,
+    panel_id: int,
+    remnawave_uuid: str,
+    state: str,
+) -> bool:
+    """Обновить Node.state по (panel_id, remnawave_uuid). Вернуть True, если
+    статус изменился.
+
+    Для кнопки «Синхронизировать»: список панели уже несёт живой статус каждой
+    ноды, поэтому одним проходом освежаем статусы всех уже импортированных нод,
+    не опрашивая панель отдельно по каждой. Адресуем по uuid (в синке node_id
+    нет). Пишем только при изменении, чтобы не дёргать БД впустую; нет такой
+    ноды — молча False."""
+    async with session_factory() as session:
+        node = await session.scalar(
+            select(Node).where(
+                Node.panel_id == panel_id,
+                Node.remnawave_uuid == remnawave_uuid,
+            )
+        )
+        if node is None or node.state == state:
+            return False
+        node.state = state
+        await session.commit()
+        return True
+
+
 async def set_node_fields(
     session_factory: async_sessionmaker,
     node_id: int,
