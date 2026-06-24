@@ -34,7 +34,8 @@ class _FakeNode:
     """Имитация NodeResponseDto: только нужные поля."""
 
     def __init__(self, *, uuid="u-1", name="node-1", address="1.2.3.4", port=3000,
-                 is_connected=False, is_connecting=False, is_disabled=False):
+                 is_connected=False, is_connecting=False, is_disabled=False,
+                 config_profile=None):
         self.uuid = uuid
         self.name = name
         self.address = address
@@ -42,12 +43,21 @@ class _FakeNode:
         self.is_connected = is_connected
         self.is_connecting = is_connecting
         self.is_disabled = is_disabled
+        # node.config_profile.active_config_profile_uuid + active_inbounds (форма
+        # SDK 2.7.x). По умолчанию профиль с одним активным инбаундом.
+        if config_profile is None:
+            config_profile = types.SimpleNamespace(
+                active_config_profile_uuid="prof-1",
+                active_inbounds=[types.SimpleNamespace(uuid="inb-old")],
+            )
+        self.config_profile = config_profile
 
 
 class _FakeNodes:
     def __init__(self, node):
         self._node = node
         self.created_body = None
+        self.updated_body = None
 
     async def create_node(self, body):
         self.created_body = body
@@ -55,6 +65,10 @@ class _FakeNodes:
 
     async def get_one_node(self, uuid):
         self.requested_uuid = uuid
+        return self._node
+
+    async def update_node(self, body):
+        self.updated_body = body
         return self._node
 
 
@@ -225,6 +239,34 @@ async def test_get_config_profile_returns_full_config():
     # read-modify-write при добавлении нового инбаунда.
     assert prof.config["inbounds"][0]["tag"] == "vless-reality-tcp-1-2-3-4"
     assert prof.tag_to_inbound == {"vless-reality-tcp-1-2-3-4": "inb-old"}
+
+
+@pytest.mark.asyncio
+async def test_get_node_config_extracts_profile_and_inbounds():
+    c = _client(_FakeNode())
+    ref = await c.get_node_config("u-1")
+    assert ref.node_uuid == "u-1"
+    assert ref.profile_uuid == "prof-1"
+    assert ref.active_inbound_uuids == ["inb-old"]
+
+
+@pytest.mark.asyncio
+async def test_update_node_active_inbounds_passes_dto(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def fake_build(uuid, profile_uuid, active):
+        captured["args"] = (uuid, profile_uuid, active)
+        return sentinel
+
+    monkeypatch.setattr(rc, "_build_update_node_request", fake_build)
+    sdk = _FakeSDK(_FakeNode())
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    await c.update_node_active_inbounds("u-1", "prof-1", ["inb-old", "inb-hy2"])
+
+    assert sdk.nodes.updated_body is sentinel
+    assert captured["args"] == ("u-1", "prof-1", ["inb-old", "inb-hy2"])
 
 
 @pytest.mark.asyncio

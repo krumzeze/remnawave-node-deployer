@@ -82,6 +82,21 @@ class FetchedProfile:
 
 
 @dataclass
+class NodeProfileRef:
+    """Привязка ноды к профилю: какой config-profile активен и какие инбаунды
+    ноды включены.
+
+    Нужно для добавления инбаунда к развёрнутой ноде: новый инбаунд мало завести
+    в профиле — его uuid надо ещё дописать в активные инбаунды самой ноды, иначе
+    нода его не поднимет. active_inbound_uuids — текущий список (read-modify-write,
+    как у сквадов)."""
+
+    node_uuid: str
+    profile_uuid: str | None
+    active_inbound_uuids: list[str]
+
+
+@dataclass
 class InternalSquadRef:
     """Внутренний сквад панели и uuid'ы его инбаундов.
 
@@ -209,6 +224,27 @@ def _build_create_request(
         country_code=country_code,
         config_profile=NodeConfigProfileRequestDto(
             activeConfigProfileUuid=UUID(str(config_profile_uuid)),
+            activeInbounds=[UUID(str(i)) for i in active_inbounds],
+        ),
+    )
+
+
+def _build_update_node_request(
+    uuid: str, profile_uuid: str, active_inbounds: list[str]
+):
+    """Собрать UpdateNodeRequestDto, меняющий только привязку профиля/инбаундов.
+
+    Нужно, чтобы добавленный в профиль инбаунд стал активным на ноде: шлём uuid
+    ноды + полный (объединённый) список активных инбаундов. Прочие поля ноды не
+    трогаем — передаём только config_profile. Импорт ленивый, как у остальных."""
+    from uuid import UUID
+
+    from remnawave.models import NodeConfigProfileRequestDto, UpdateNodeRequestDto
+
+    return UpdateNodeRequestDto(
+        uuid=UUID(str(uuid)),
+        config_profile=NodeConfigProfileRequestDto(
+            activeConfigProfileUuid=UUID(str(profile_uuid)),
             activeInbounds=[UUID(str(i)) for i in active_inbounds],
         ),
     )
@@ -510,6 +546,37 @@ class RemnawaveClient:
         """Состояние ноды по uuid; поллим до NodeConnState.ONLINE."""
         node = await self._sdk.nodes.get_one_node(uuid=str(uuid))
         return _derive_status(node)
+
+    async def get_node_config(self, uuid: str) -> NodeProfileRef:
+        """Активный профиль ноды и её включённые инбаунды.
+
+        Нужно для добавления инбаунда к развёрнутой ноде: узнаём, какой профиль
+        у ноды активен (его и будем дополнять) и какие инбаунды у неё уже включены
+        (чтобы дописать новый, не сбросив остальные). Форма ответа SDK 2.7.x —
+        node.config_profile с active_config_profile_uuid и active_inbounds."""
+        node = await self._sdk.nodes.get_one_node(uuid=str(uuid))
+        cp = getattr(node, "config_profile", None)
+        profile_uuid = getattr(cp, "active_config_profile_uuid", None)
+        active = getattr(cp, "active_inbounds", None) or []
+        inbound_uuids = [
+            str(getattr(i, "uuid", i)) for i in active
+        ]
+        return NodeProfileRef(
+            node_uuid=str(node.uuid),
+            profile_uuid=str(profile_uuid) if profile_uuid is not None else None,
+            active_inbound_uuids=inbound_uuids,
+        )
+
+    async def update_node_active_inbounds(
+        self, uuid: str, profile_uuid: str, active_inbound_uuids: list[str]
+    ) -> None:
+        """Заменить набор активных инбаундов ноды (под её профилем).
+
+        Передаём ПОЛНЫЙ объединённый список (старые + новый): update заменяет
+        активные инбаунды целиком, не мёржит. Профиль ноды не меняем — передаём
+        тот же activeConfigProfileUuid."""
+        body = _build_update_node_request(uuid, profile_uuid, active_inbound_uuids)
+        await self._sdk.nodes.update_node(body=body)
 
     async def list_hosts(self) -> list[HostRef]:
         """Существующие хосты панели для дедупликации при повторном провижене.
