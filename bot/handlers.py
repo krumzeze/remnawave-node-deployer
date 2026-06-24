@@ -29,7 +29,7 @@ from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 
 from bot import keyboards
-from bot.callbacks import MenuCB, NodeCB, PanelCB, WizCB
+from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, WizCB
 from bot.states import AddNode, AdoptNode, SetPanel
 from config import settings
 from orchestrator import domain
@@ -584,6 +584,127 @@ async def node_refresh(query: CallbackQuery, callback_data: NodeCB) -> None:
         keyboards.node_actions(node.id, has_ssh=node.ssh_key_vault_path is not None),
     )
     await query.answer("Обновлено")
+
+
+# --------------------------------------------------------------------------
+# Добавление инбаунда к уже развёрнутой ноде (Фаза 3 Hysteria2).
+# --------------------------------------------------------------------------
+def _read_node_ssh(node_id: int) -> tuple[str | None, str]:
+    """Приватный ключ и логин ноды из Vault (nodes/{id}/ssh). Логин по умолчанию
+    root — для старых нод без логина рядом с ключом (как в node-операциях)."""
+    from secretstore.vault import VaultStore
+
+    try:
+        data = VaultStore().get(f"nodes/{node_id}/ssh") or {}
+    except Exception as exc:  # noqa: BLE001 — нет ключа/Vault недоступен
+        logger.warning("addcfg: не прочитать ключ ноды %s: %s", node_id, exc)
+        return None, "root"
+    return data.get("private_key"), data.get("login", "root")
+
+
+@router.callback_query(NodeCB.filter(F.action == "addcfg"))
+async def node_addcfg_start(query: CallbackQuery, callback_data: NodeCB) -> None:
+    """Показать список инбаундов, которые можно добавить к этой ноде.
+
+    Совместимость считаем по текущему профилю ноды (что уже есть и есть ли домен)
+    — см. xray_config.available_choices_for_node."""
+    from db import get_sessionmaker
+    from db.repo import get_node_for_owner
+    from orchestrator.node_inbound import _extract_tls
+    from orchestrator.xray_config import available_choices_for_node
+
+    owner = _owner_of(query)
+    node = await get_node_for_owner(get_sessionmaker(), callback_data.node_id, owner)
+    if node is None:
+        await query.answer("Нода не найдена.", show_alert=True)
+        return
+    if not node.ssh_key_vault_path:
+        await query.answer("Нужен SSH-доступ — сначала удочери ноду.", show_alert=True)
+        return
+    if not node.remnawave_uuid:
+        await query.answer("Нода не зарегистрирована в панели.", show_alert=True)
+        return
+    saved = await _load_saved_panel(owner)
+    if not saved:
+        await query.answer("Не удалось прочитать панель из Vault.", show_alert=True)
+        return
+    url, token = saved
+    try:
+        client = _make_client(url, token)
+        node_cfg = await client.get_node_config(node.remnawave_uuid)
+        profile = await client.get_config_profile(node_cfg.profile_uuid)
+    except Exception as exc:  # noqa: BLE001 — недоступность панели не должна ронять экран
+        logger.warning("addcfg: не прочитать профиль ноды %s: %s", node.id, exc)
+        await query.answer("Панель недоступна, попробуй позже.", show_alert=True)
+        return
+
+    has_domain = _extract_tls(profile.config) is not None
+    available = available_choices_for_node(
+        list(profile.tag_to_inbound), has_domain=has_domain
+    )
+    if not available:
+        await query.answer(
+            "Все совместимые инбаунды уже есть на ноде.", show_alert=True
+        )
+        return
+    options = [
+        (num, label) for num, choice, label in INBOUND_MENU if choice in available
+    ]
+    await _render(
+        query,
+        f"Добавить инбаунд на ноду {node.ip}.\n"
+        "Выбери, что добавить (порт подберётся автоматически):",
+        keyboards.add_inbound_kb(node.id, options),
+    )
+    await query.answer()
+
+
+@router.callback_query(AddCfgCB.filter())
+async def node_addcfg_pick(query: CallbackQuery, callback_data: AddCfgCB) -> None:
+    """Выполнить добавление выбранного инбаунда к ноде (inline, как удочерение)."""
+    from db import get_sessionmaker
+    from db.repo import get_node_for_owner
+
+    owner = _owner_of(query)
+    node = await get_node_for_owner(get_sessionmaker(), callback_data.node_id, owner)
+    if node is None:
+        await query.answer("Нода не найдена.", show_alert=True)
+        return
+    choice = _MENU_BY_NUMBER.get(callback_data.num)
+    if choice is None:
+        await query.answer("Неизвестный инбаунд.", show_alert=True)
+        return
+    saved = await _load_saved_panel(owner)
+    if not saved:
+        await query.answer("Не удалось прочитать панель из Vault.", show_alert=True)
+        return
+    priv, login = _read_node_ssh(node.id)
+    if not priv:
+        await query.answer("Нет SSH-ключа ноды в Vault.", show_alert=True)
+        return
+
+    url, token = saved
+    await _render(query, f"Добавляю инбаунд на {node.ip} — это займёт минуту…")
+    from orchestrator import node_ops
+    from orchestrator.node_inbound import add_inbound_to_node
+
+    try:
+        client = _make_client(url, token)
+        res = await add_inbound_to_node(
+            choice=choice, ip=node.ip, node_uuid=node.remnawave_uuid,
+            country_code="XX", ssh_login=login, ssh_private_key=priv,
+            client=client, open_port=node_ops.open_port,
+        )
+        detail = res.detail
+    except Exception as exc:  # noqa: BLE001 — сбой добавления не должен ронять бот
+        logger.warning("addcfg: добавление инбаунда на ноду %s упало: %s", node.id, exc)
+        detail = f"Не удалось добавить инбаунд: {exc}"
+
+    await _render(
+        query, detail,
+        keyboards.node_actions(node.id, has_ssh=node.ssh_key_vault_path is not None),
+    )
+    await query.answer()
 
 
 @router.callback_query(NodeCB.filter(F.action == "ask_delete"))

@@ -10,7 +10,7 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.callbacks import MenuCB, NodeCB, PanelCB, WizCB
+from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, WizCB
 from config import settings
 
 # Значок состояния ноды для списка. Состояния — из state-машины провижининга
@@ -78,12 +78,28 @@ def node_actions(node_id: int, *, has_ssh: bool = True) -> InlineKeyboardMarkup:
     b.button(text="🔄 Обновить статус", callback_data=NodeCB(action="refresh", node_id=node_id))
     if has_ssh:
         # Управление по SSH-ключу (ADR 0013): лёгкий рестарт и тяжёлый ребут.
+        # «Добавить конфиг» тоже требует SSH (открыть порт инбаунда в UFW).
+        b.button(text="➕ Добавить конфиг", callback_data=NodeCB(action="addcfg", node_id=node_id))
         b.button(text="♻️ Перезапустить ноду", callback_data=NodeCB(action="restart", node_id=node_id))
         b.button(text="🔁 Перезагрузить сервер", callback_data=NodeCB(action="ask_reboot", node_id=node_id))
     else:
         b.button(text="🤝 Удочерить (дать SSH-доступ)", callback_data=NodeCB(action="adopt", node_id=node_id))
     b.button(text="🗑 Убрать ноду", callback_data=NodeCB(action="ask_delete", node_id=node_id))
     b.button(text="⬅️ К списку", callback_data=MenuCB(action="nodes"))
+    b.adjust(1)
+    return b.as_markup()
+
+
+def add_inbound_kb(node_id: int, options) -> InlineKeyboardMarkup:
+    """Выбор одного инбаунда для добавления к ноде.
+
+    options — список (num, label) совместимых пунктов (отфильтрованных под ноду).
+    Одиночный выбор: нажатие сразу запускает добавление (в отличие от мастера,
+    где мультивыбор с «Готово»)."""
+    b = InlineKeyboardBuilder()
+    for num, label in options:
+        b.button(text=label, callback_data=AddCfgCB(node_id=node_id, num=num))
+    b.button(text="↩️ Отмена", callback_data=NodeCB(action="open", node_id=node_id))
     b.adjust(1)
     return b.as_markup()
 
