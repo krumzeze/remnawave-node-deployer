@@ -572,6 +572,10 @@ def test_host_remark_format():
     assert tasks._host_remark("NL", "firefox") == "🇳🇱 Нидерланды · Firefox"
     # Без отпечатка (Shadowsocks) хвост «· …» опускаем.
     assert tasks._host_remark("DE", None) == "🇩🇪 Германия"
+    # Hysteria2: отпечатка нет, в хвост идёт имя протокола.
+    assert tasks._host_remark("NL", None, network="hysteria") == "🇳🇱 Нидерланды · Hysteria"
+    # Отпечаток приоритетнее протокола (для TLS/Reality остаётся как было).
+    assert tasks._host_remark("NL", "firefox", network="hysteria") == "🇳🇱 Нидерланды · Firefox"
     # Неизвестный код: название = сам код, флаг всё равно валиден.
     assert tasks._host_remark("XX", "firefox") == "🇽🇽 XX · Firefox"
     # Нижний регистр нормализуется, пустой код → XX.

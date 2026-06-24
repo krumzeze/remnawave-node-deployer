@@ -193,6 +193,10 @@ def xray_config_host_remark(country_code: str, hint) -> str:
     try:
         from orchestrator.tasks import _host_remark
 
-        return _host_remark(country_code, hint.fingerprint if hint else None)
+        return _host_remark(
+            country_code,
+            hint.fingerprint if hint else None,
+            network=hint.network if hint else None,
+        )
     except Exception:  # noqa: BLE001 — remark не критичен, не должен валить добавление
         return (country_code or "XX").upper()

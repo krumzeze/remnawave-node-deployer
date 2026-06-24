@@ -112,18 +112,24 @@ def _country_flag(code: str) -> str:
     return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in code)
 
 
-def _host_remark(country_code: str, fingerprint: str | None) -> str:
-    """Человекочитаемый remark host'а: «<флаг> <страна> · <Отпечаток>».
+def _host_remark(
+    country_code: str, fingerprint: str | None, *, network: str | None = None
+) -> str:
+    """Человекочитаемый remark host'а: «<флаг> <страна> · <хвост>».
 
-    Без отпечатка (например, Shadowsocks — там uTLS нет) хвост «· …» опускаем,
-    остаётся «<флаг> <страна>». Для неизвестного кода страны название = сам код.
-    Длину режем под лимит панели (HOST_REMARK_MAXLEN)."""
+    Хвост: отпечаток uTLS (Firefox) для TCP-TLS/Reality-инбаундов, либо имя
+    протокола для тех, у кого отпечатка нет — у Hysteria2 (QUIC) uTLS нет, и
+    показывать «Hysteria» полезнее пустоты. У Shadowsocks нет ни того, ни
+    другого — остаётся «<флаг> <страна>». Для неизвестного кода страны название =
+    сам код. Длину режем под лимит панели (HOST_REMARK_MAXLEN)."""
     code = (country_code or "XX").strip().upper()
     name = _COUNTRY_NAMES_RU.get(code, code)
     flag = _country_flag(code)
     label = f"{flag} {name}".strip()
     if fingerprint:
         label = f"{label} · {fingerprint.capitalize()}"
+    elif network == "hysteria":
+        label = f"{label} · Hysteria"
     return label[:HOST_REMARK_MAXLEN]
 
 
@@ -637,7 +643,9 @@ class _Pipeline:
                 inbound_uuid=inbound_uuid,
                 config_profile_uuid=profile.uuid,
                 remark=_host_remark(
-                    country_code, hint.fingerprint if hint else None
+                    country_code,
+                    hint.fingerprint if hint else None,
+                    network=hint.network if hint else None,
                 ),
                 address=address,
                 port=port,
