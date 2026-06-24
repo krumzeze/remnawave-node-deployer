@@ -115,6 +115,36 @@ async def test_alert_only_after_threshold(sm):
 
 
 @pytest.mark.asyncio
+async def test_connecting_also_triggers_alert(sm):
+    # Упавшая нода часто висит в connecting (вечный реконнект), а не в offline.
+    # Это тоже недоступность — алерт должен сработать после порога.
+    await _seed_node(sm, state="online")
+    sent: list = []
+    counts: dict = {}
+    alerted: set = set()
+    args = _poller(NodeConnState.CONNECTING, sent, counts=counts, alerted=alerted)
+
+    for _ in range(monitor.OFFLINE_ALERT_THRESHOLD):
+        await monitor.run_status_poll(session_factory=sm, **args)
+    assert len(sent) == 1
+    assert "не отвечает" in sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_disabled_does_not_trigger_alert(sm):
+    # Выключенную оператором ноду (disabled) за недоступность не считаем.
+    await _seed_node(sm, state="online")
+    sent: list = []
+    counts: dict = {}
+    alerted: set = set()
+    args = _poller(NodeConnState.DISABLED, sent, counts=counts, alerted=alerted)
+
+    for _ in range(monitor.OFFLINE_ALERT_THRESHOLD + 1):
+        await monitor.run_status_poll(session_factory=sm, **args)
+    assert sent == []
+
+
+@pytest.mark.asyncio
 async def test_recovery_message_after_alert(sm):
     nid = await _seed_node(sm, state="online")
     sent: list = []
