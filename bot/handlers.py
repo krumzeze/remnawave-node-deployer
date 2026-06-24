@@ -49,6 +49,7 @@ INBOUND_MENU: tuple[tuple[str, InboundChoice, str], ...] = (
     ("4", InboundChoice.VLESS_GRPC_REALITY, "VLESS + gRPC + Reality"),
     ("5", InboundChoice.TROJAN_WS_TLS, "Trojan + WS + TLS (нужен домен)"),
     ("6", InboundChoice.SHADOWSOCKS, "Shadowsocks"),
+    ("7", InboundChoice.HYSTERIA2, "Hysteria2 (нужен домен)"),
 )
 _MENU_BY_NUMBER = {num: choice for num, choice, _ in INBOUND_MENU}
 
