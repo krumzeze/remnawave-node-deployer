@@ -228,3 +228,60 @@ def test_host_hints_shadowsocks_no_security():
     assert h.security == "none"
     assert h.sni is None
     assert h.fingerprint is None
+
+
+def test_hysteria2_requires_domain_and_cert():
+    # Hysteria2 — доменный инбаунд (TLS обязателен), без домена/cert падает.
+    with pytest.raises(ValueError):
+        build_profile([InboundChoice.HYSTERIA2])
+    with pytest.raises(ValueError):
+        build_profile([InboundChoice.HYSTERIA2], tls_domain="vpn.example.com")
+
+
+def test_hysteria2_inbound_structure():
+    prof = build_profile(
+        [InboundChoice.HYSTERIA2],
+        tls_domain="vpn.example.com",
+        cert_file="/c/fullchain.pem",
+        key_file="/c/key.pem",
+    )
+    inb = prof.config["inbounds"][0]
+    assert inb["protocol"] == "hysteria"
+    assert inb["settings"]["version"] == 2
+    assert inb["settings"]["clients"] == []  # пользователей подставляет панель
+    ss = inb["streamSettings"]
+    assert ss["network"] == "hysteria"
+    assert ss["security"] == "tls"
+    assert ss["hysteriaSettings"]["version"] == 2
+    tls = ss["tlsSettings"]
+    assert tls["alpn"] == ["h3"]
+    assert tls["serverName"] == "vpn.example.com"
+    assert tls["certificates"][0]["certificateFile"] == "/c/fullchain.pem"
+    assert tls["certificates"][0]["keyFile"] == "/c/key.pem"
+    # Hysteria2 не Reality — ключей быть не должно.
+    assert prof.reality_keys == {}
+
+
+def test_hysteria2_port_marked_udp():
+    prof = build_profile(
+        [InboundChoice.HYSTERIA2],
+        tls_domain="vpn.example.com",
+        cert_file="/c/fullchain.pem",
+        key_file="/c/key.pem",
+    )
+    port = prof.ports["hysteria2"]
+    assert port in prof.udp_ports, "Hysteria2 (QUIC) должен открываться по UDP"
+
+
+def test_host_hints_hysteria2_tls_no_fingerprint():
+    prof = build_profile(
+        [InboundChoice.HYSTERIA2],
+        tls_domain="vpn.example.com",
+        cert_file="/c/fullchain.pem",
+        key_file="/c/key.pem",
+    )
+    h = prof.hosts["hysteria2"]
+    assert h.security == "tls"
+    assert h.network == "hysteria"
+    assert h.sni == "vpn.example.com"
+    assert h.fingerprint is None  # QUIC, uTLS-отпечатка нет
