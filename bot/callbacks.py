@@ -21,6 +21,15 @@ class NodeCB(CallbackData, prefix="n"):
     node_id: int
 
 
+class AddCfgCB(CallbackData, prefix="ac"):
+    """Добавление инбаунда к уже развёрнутой ноде из её карточки.
+
+    num — номер пункта INBOUND_MENU (как в WizCB.inb); по нему находим
+    InboundChoice. Длинные значения в callback не кладём — лимит 64 байта."""
+    node_id: int
+    num: str  # номер пункта меню inbound'ов, либо "cancel"
+
+
 class PanelCB(CallbackData, prefix="p"):
     """Раздел управления сохранённой панелью."""
     action: str  # change

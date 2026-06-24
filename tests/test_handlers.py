@@ -20,6 +20,7 @@ from orchestrator.xray_config import InboundChoice
         ("6,4", [InboundChoice.SHADOWSOCKS.value, InboundChoice.VLESS_GRPC_REALITY.value]),
         ("3", [InboundChoice.VLESS_XHTTP_TLS.value]),       # TLS-пункт
         ("5", [InboundChoice.TROJAN_WS_TLS.value]),         # TLS-пункт
+        ("7", [InboundChoice.HYSTERIA2.value]),             # Hysteria2 (доменный)
         ("1 1 1", [InboundChoice.VLESS_REALITY_TCP.value]),  # дубли схлопываются
     ],
 )
@@ -43,6 +44,7 @@ def test_parse_inbounds_unknown_raises():
         ([InboundChoice.SHADOWSOCKS.value], False),
         ([InboundChoice.VLESS_XHTTP_TLS.value], True),
         ([InboundChoice.TROJAN_WS_TLS.value], True),
+        ([InboundChoice.HYSTERIA2.value], True),    # Hysteria2 — TLS обязателен
         ([InboundChoice.VLESS_REALITY_TCP.value,
           InboundChoice.TROJAN_WS_TLS.value], True),  # хотя бы один TLS
     ],

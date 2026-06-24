@@ -95,3 +95,31 @@ async def reboot_server(
             "через пару минут (статус обновит поллер).",
         )
     return res
+
+
+def _ufw_allow_cmd(inbound_port: int, *, udp: bool) -> str:
+    """Команда открытия порта в UFW. Идемпотентна: ufw allow повторно не плодит
+    правил. Для UDP-инбаунда (Hysteria2/Shadowsocks) открываем udp, иначе tcp.
+
+    Если UFW на ноде неактивен (например, кастомная нода без него) — `ufw allow`
+    всё равно вернёт 0 (правило просто запишется и применится при включении), так
+    что отдельный инбаунд это не ломает."""
+    proto = "udp" if udp else "tcp"
+    return f"ufw allow {int(inbound_port)}/{proto}"
+
+
+async def open_port(
+    ip: str, login: str, private_key: str, inbound_port: int, *,
+    udp: bool = False, port: int = 22,
+) -> OpResult:
+    """Открыть порт инбаунда в UFW ноды (для добавления инбаунда к ноде).
+
+    udp=True для QUIC/UDP-инбаундов (Hysteria2) и Shadowsocks. Возвращает OpResult:
+    при сбое подключения — то же понятное «сервер недоступен», что и у restart."""
+    res = await _connect_run(
+        ip, login, private_key, _ufw_allow_cmd(inbound_port, udp=udp), port=port
+    )
+    if res.ok:
+        proto = "udp" if udp else "tcp"
+        return OpResult(ok=True, detail=f"Порт {inbound_port}/{proto} открыт.")
+    return res

@@ -8,7 +8,7 @@ from __future__ import annotations
 from aiogram.filters.callback_data import CallbackData
 
 from bot import handlers, keyboards
-from bot.callbacks import MenuCB, NodeCB, WizCB
+from bot.callbacks import AddCfgCB, MenuCB, NodeCB, WizCB
 from bot.handlers import INBOUND_MENU
 
 
@@ -68,6 +68,27 @@ def test_node_actions_shows_adopt_only_without_ssh():
     # С SSH-доступом — управление, без удочерения.
     assert "adopt" not in withssh
     assert "restart" in withssh and "ask_reboot" in withssh
+    # «Добавить конфиг» доступно только при SSH (нужно открыть порт).
+    assert "addcfg" in withssh
+    assert "addcfg" not in without
+
+
+def test_add_inbound_kb_carries_node_and_num():
+    options = [("3", "VLESS + XHTTP + TLS"), ("7", "Hysteria2")]
+    markup = keyboards.add_inbound_kb(42, options)
+    picks = [
+        AddCfgCB.unpack(b.callback_data)
+        for b in _all_buttons(markup)
+        if b.callback_data.startswith("ac:")
+    ]
+    assert {(p.node_id, p.num) for p in picks} == {(42, "3"), (42, "7")}
+    # Кнопка отмены ведёт обратно к открытию ноды.
+    cancels = [
+        NodeCB.unpack(b.callback_data).action
+        for b in _all_buttons(markup)
+        if b.callback_data.startswith("n:")
+    ]
+    assert cancels == ["open"]
 
 
 def test_main_menu_has_three_actions():

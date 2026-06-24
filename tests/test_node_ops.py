@@ -89,3 +89,19 @@ async def test_command_nonzero_exit_reports_stderr(patch_ssh):
     res = await node_ops.restart_node("1.2.3.4", "root", "PRIV")
     assert res.ok is False
     assert "No such container" in res.detail
+
+
+def test_ufw_allow_cmd_tcp_and_udp():
+    assert node_ops._ufw_allow_cmd(8443, udp=False) == "ufw allow 8443/tcp"
+    assert node_ops._ufw_allow_cmd(443, udp=True) == "ufw allow 443/udp"
+
+
+@pytest.mark.asyncio
+async def test_open_port_udp_runs_ufw(patch_ssh):
+    conn = FakeConn(FakeRun(exit_status=0))
+    patch_ssh(conn=conn)
+
+    res = await node_ops.open_port("1.2.3.4", "root", "PRIV", 443, udp=True)
+    assert res.ok
+    assert conn.cmd == "ufw allow 443/udp"
+    assert "443/udp" in res.detail

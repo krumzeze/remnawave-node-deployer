@@ -50,10 +50,19 @@ class InboundChoice(str, enum.Enum):
     VLESS_GRPC_REALITY = "vless-grpc-reality"    # domain-free
     TROJAN_WS_TLS = "trojan-ws-tls"              # нужен домен
     SHADOWSOCKS = "shadowsocks"                  # domain-free
+    HYSTERIA2 = "hysteria2"                       # нужен домен, UDP/QUIC
 
 
-# Какие варианты требуют домена и сертификата (ветка TLS в ADR 0005).
-TLS_CHOICES = frozenset({InboundChoice.VLESS_XHTTP_TLS, InboundChoice.TROJAN_WS_TLS})
+# Какие варианты требуют домена и сертификата (ветка TLS в ADR 0005). Hysteria2
+# здесь же: TLS у него обязателен (QUIC поверх TLS1.3), сертификат тот же, что и
+# у прочих доменных инбаундов (acme.sh, см. _setup_tls в tasks.py).
+TLS_CHOICES = frozenset(
+    {
+        InboundChoice.VLESS_XHTTP_TLS,
+        InboundChoice.TROJAN_WS_TLS,
+        InboundChoice.HYSTERIA2,
+    }
+)
 
 # Какие варианты используют Reality и потому требуют генерации ключей.
 REALITY_CHOICES = frozenset(
@@ -68,7 +77,52 @@ REALITY_CHOICES = frozenset(
 # 443, остальные — фиксированные высокие порты по очереди. Так несколько
 # inbound'ов уживаются на одной ноде (см. «Последствия» ADR 0005).
 PORT_443 = 443
-FALLBACK_PORTS = (8443, 2053, 2083, 2087, 2096)
+# Пул должен вмещать все типы инбаундов разом (дефолт «все»): 443 + фолбэки ≥
+# числу пунктов меню, иначе раздача портов упрётся в исчерпание пула.
+FALLBACK_PORTS = (8443, 8444, 2053, 2083, 2087, 2096)
+
+
+def base_choice_from_tag(tag: str) -> InboundChoice | None:
+    """Вытащить пункт меню из тега инбаунда профиля, либо None.
+
+    Теги в профиле — это `<choice.value>` с per-node суффиксом (`vless-reality-
+    tcp-1-2-3-4`), а у простых случаев — голый `choice.value`. Сопоставляем по
+    точному совпадению или префиксу `value-`. Берём самое длинное совпадение,
+    чтобы значения-префиксы не путались между собой (на случай будущих пунктов).
+    """
+    if not tag:
+        return None
+    best: InboundChoice | None = None
+    for choice in InboundChoice:
+        v = choice.value
+        if tag == v or tag.startswith(v + "-"):
+            if best is None or len(v) > len(best.value):
+                best = choice
+    return best
+
+
+def available_choices_for_node(
+    existing_tags: list[str], *, has_domain: bool
+) -> list[InboundChoice]:
+    """Какие инбаунды можно добавить к уже развёрнутой ноде.
+
+    Отсеиваем: (1) те, что на ноде уже есть (по базовому тегу — повторno тот же
+    инбаунд не заводим), (2) доменные (TLS/Hysteria2), если у ноды нет домена с
+    сертификатом — без него такой инбаунд не поднять. has_domain выводится выше
+    по стеку из того, есть ли среди существующих тегов хоть один доменный (тогда
+    сертификат на ноде уже выпущен). Порядок — как в InboundChoice (стабильный
+    для UI)."""
+    present = {
+        c for c in (base_choice_from_tag(t) for t in existing_tags) if c is not None
+    }
+    out: list[InboundChoice] = []
+    for choice in InboundChoice:
+        if choice in present:
+            continue
+        if choice in TLS_CHOICES and not has_domain:
+            continue
+        out.append(choice)
+    return out
 
 
 def _b64url_nopad(raw: bytes) -> str:
@@ -141,6 +195,7 @@ _HOST_SHAPE: dict[InboundChoice, dict] = {
     InboundChoice.VLESS_XHTTP_TLS: {"security": "tls", "network": "xhttp", "path": "/"},
     InboundChoice.TROJAN_WS_TLS: {"security": "tls", "network": "ws", "path": "/"},
     InboundChoice.SHADOWSOCKS: {"security": "none", "network": "tcp"},
+    InboundChoice.HYSTERIA2: {"security": "tls", "network": "hysteria"},
 }
 
 
@@ -156,7 +211,9 @@ def _host_hint(choice: InboundChoice, *, server_names: list[str],
         fingerprint = DEFAULT_FINGERPRINT
     elif security == "tls":
         sni = tls_domain
-        fingerprint = DEFAULT_FINGERPRINT
+        # Hysteria2 — это QUIC, у него нет uTLS-отпечатка (fingerprint), он
+        # относится только к TCP-TLS клиентам. Для остальных TLS-инбаундов — firefox.
+        fingerprint = None if choice is InboundChoice.HYSTERIA2 else DEFAULT_FINGERPRINT
     else:
         sni = None
         fingerprint = None
@@ -308,6 +365,31 @@ def _build_inbound(choice: InboundChoice, port: int, *, keys: RealityKeys | None
             "streamSettings": {"network": "tcp"},
         }
 
+    if choice is InboundChoice.HYSTERIA2:
+        # Hysteria2 в Remnawave (нода 2.7.0+) — это inbound её форка Xray-core:
+        # protocol "hysteria" + version 2, транспорт "hysteria" (QUIC поверх
+        # UDP), TLS обязателен с alpn ["h3"]. Формат сверен по официальным
+        # шаблонам remnawave/templates. Сертификат — тот же, что у прочих
+        # доменных инбаундов (acme.sh на ноде, см. _setup_tls). Клиентов панель
+        # подставляет сама, как и в остальных инбаундах.
+        return {
+            "tag": tag, "port": port, "listen": "0.0.0.0",
+            "protocol": "hysteria",
+            "settings": {"clients": [], "version": 2},
+            "streamSettings": {
+                "network": "hysteria",
+                "security": "tls",
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "serverName": tls_domain,
+                    "certificates": [
+                        {"certificateFile": cert_file, "keyFile": key_file},
+                    ],
+                },
+                "hysteriaSettings": {"version": 2},
+            },
+        }
+
     raise ValueError(f"неизвестный inbound: {choice!r}")
 
 
@@ -402,7 +484,9 @@ def build_profile(
             server_names=list(reality_server_names),
             tls_domain=tls_domain,
         )
-        if choice is InboundChoice.SHADOWSOCKS:
+        # UDP-инбаунды (для UFW открыть порт по udp): Shadowsocks (tcp,udp) и
+        # Hysteria2 (чистый QUIC/UDP).
+        if choice in (InboundChoice.SHADOWSOCKS, InboundChoice.HYSTERIA2):
             udp_ports.append(ports[choice])
         if keys is not None:
             reality_keys[tag] = keys

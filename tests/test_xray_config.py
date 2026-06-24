@@ -15,6 +15,8 @@ from orchestrator.xray_config import (
     DEFAULT_REALITY_DEST,
     InboundChoice,
     REALITY_CHOICES,
+    available_choices_for_node,
+    base_choice_from_tag,
     build_profile,
     generate_reality_keys,
 )
@@ -228,3 +230,99 @@ def test_host_hints_shadowsocks_no_security():
     assert h.security == "none"
     assert h.sni is None
     assert h.fingerprint is None
+
+
+def test_hysteria2_requires_domain_and_cert():
+    # Hysteria2 — доменный инбаунд (TLS обязателен), без домена/cert падает.
+    with pytest.raises(ValueError):
+        build_profile([InboundChoice.HYSTERIA2])
+    with pytest.raises(ValueError):
+        build_profile([InboundChoice.HYSTERIA2], tls_domain="vpn.example.com")
+
+
+def test_hysteria2_inbound_structure():
+    prof = build_profile(
+        [InboundChoice.HYSTERIA2],
+        tls_domain="vpn.example.com",
+        cert_file="/c/fullchain.pem",
+        key_file="/c/key.pem",
+    )
+    inb = prof.config["inbounds"][0]
+    assert inb["protocol"] == "hysteria"
+    assert inb["settings"]["version"] == 2
+    assert inb["settings"]["clients"] == []  # пользователей подставляет панель
+    ss = inb["streamSettings"]
+    assert ss["network"] == "hysteria"
+    assert ss["security"] == "tls"
+    assert ss["hysteriaSettings"]["version"] == 2
+    tls = ss["tlsSettings"]
+    assert tls["alpn"] == ["h3"]
+    assert tls["serverName"] == "vpn.example.com"
+    assert tls["certificates"][0]["certificateFile"] == "/c/fullchain.pem"
+    assert tls["certificates"][0]["keyFile"] == "/c/key.pem"
+    # Hysteria2 не Reality — ключей быть не должно.
+    assert prof.reality_keys == {}
+
+
+def test_hysteria2_port_marked_udp():
+    prof = build_profile(
+        [InboundChoice.HYSTERIA2],
+        tls_domain="vpn.example.com",
+        cert_file="/c/fullchain.pem",
+        key_file="/c/key.pem",
+    )
+    port = prof.ports["hysteria2"]
+    assert port in prof.udp_ports, "Hysteria2 (QUIC) должен открываться по UDP"
+
+
+def test_base_choice_from_tag():
+    # Голый тег и тег с per-node суффиксом распознаются в один и тот же пункт.
+    assert base_choice_from_tag("shadowsocks") is InboundChoice.SHADOWSOCKS
+    assert (base_choice_from_tag("vless-reality-tcp-1-2-3-4")
+            is InboundChoice.VLESS_REALITY_TCP)
+    assert base_choice_from_tag("hysteria2-94-125-103-122") is InboundChoice.HYSTERIA2
+    assert base_choice_from_tag("unknown-tag") is None
+    assert base_choice_from_tag("") is None
+
+
+def test_available_choices_excludes_present():
+    # На ноде уже есть reality-tcp и shadowsocks — их в списке добавляемых нет.
+    existing = ["vless-reality-tcp-1-2-3-4", "shadowsocks-1-2-3-4"]
+    avail = available_choices_for_node(existing, has_domain=False)
+    assert InboundChoice.VLESS_REALITY_TCP not in avail
+    assert InboundChoice.SHADOWSOCKS not in avail
+    # Domain-free reality-варианты доступны.
+    assert InboundChoice.VLESS_XHTTP_REALITY in avail
+    assert InboundChoice.VLESS_GRPC_REALITY in avail
+
+
+def test_available_choices_hide_domain_inbounds_without_domain():
+    # Без домена доменные инбаунды (TLS/Hysteria2) не предлагаем.
+    avail = available_choices_for_node([], has_domain=False)
+    assert InboundChoice.HYSTERIA2 not in avail
+    assert InboundChoice.VLESS_XHTTP_TLS not in avail
+    assert InboundChoice.TROJAN_WS_TLS not in avail
+
+
+def test_available_choices_offer_domain_inbounds_when_domain_present():
+    # У ноды есть доменный инбаунд (значит сертификат выпущен) — Hysteria2 можно.
+    existing = ["vless-xhttp-tls-1-2-3-4"]
+    avail = available_choices_for_node(existing, has_domain=True)
+    assert InboundChoice.HYSTERIA2 in avail
+    assert InboundChoice.TROJAN_WS_TLS in avail
+    # Уже стоящий tls-xhttp повторно не предлагаем.
+    assert InboundChoice.VLESS_XHTTP_TLS not in avail
+
+
+def test_host_hints_hysteria2_tls_no_fingerprint():
+    prof = build_profile(
+        [InboundChoice.HYSTERIA2],
+        tls_domain="vpn.example.com",
+        cert_file="/c/fullchain.pem",
+        key_file="/c/key.pem",
+    )
+    h = prof.hosts["hysteria2"]
+    assert h.security == "tls"
+    assert h.network == "hysteria"
+    assert h.sni == "vpn.example.com"
+    assert h.fingerprint is None  # QUIC, uTLS-отпечатка нет
