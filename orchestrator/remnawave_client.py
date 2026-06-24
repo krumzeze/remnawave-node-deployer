@@ -65,6 +65,23 @@ class CreatedProfile:
 
 
 @dataclass
+class FetchedProfile:
+    """Прочитанный из панели профиль: uuid, имя, ПОЛНЫЙ Xray-config и карта
+    tag→inbound_uuid.
+
+    Нужен для добавления инбаунда к уже развёрнутой ноде: панель отдаёт весь
+    config (со всеми существующими inbounds), мы дописываем в него новый inbound,
+    не трогая чужие, и шлём обратно через update_config_profile. tag_to_inbound —
+    текущая раскладка (чтобы понять, какие теги уже заняты, и не задвоить порт).
+    """
+
+    uuid: str
+    name: str
+    config: dict
+    tag_to_inbound: dict[str, str]
+
+
+@dataclass
 class InternalSquadRef:
     """Внутренний сквад панели и uuid'ы его инбаундов.
 
@@ -203,6 +220,17 @@ def _build_config_profile_request(name: str, config: dict):
     from remnawave.models import CreateConfigProfileRequestDto
 
     return CreateConfigProfileRequestDto(name=name, config=config)
+
+
+def _build_update_config_profile_request(uuid: str, config: dict):
+    """Собрать UpdateConfigProfileRequestDto. По контракту SDK 2.7.x обязателен
+    только uuid; name не передаём (остаётся прежним), шлём uuid + новый config.
+    Импорт ленивый — как у остальных билдеров (тесты без пакета remnawave)."""
+    from uuid import UUID
+
+    from remnawave.models import UpdateConfigProfileRequestDto
+
+    return UpdateConfigProfileRequestDto(uuid=UUID(str(uuid)), config=config)
 
 
 def _build_create_host_request(
@@ -372,6 +400,45 @@ class RemnawaveClient:
         return CreatedProfile(
             uuid=str(resp.uuid),
             tag_to_inbound={inb.tag: str(inb.uuid) for inb in resp.inbounds},
+        )
+
+    async def get_config_profile(self, uuid: str) -> FetchedProfile:
+        """Прочитать профиль по uuid вместе с его полным Xray-config.
+
+        Нужно для добавления инбаунда к уже развёрнутой ноде: панель отдаёт весь
+        config (со всеми существующими inbounds) и список inbounds с их тегами и
+        uuid'ами. Дальше вызывающий код дописывает новый inbound в config и шлёт
+        его в update_config_profile, не теряя уже заведённые."""
+        resp = await self._sdk.config_profiles.get_config_profile_by_uuid(uuid=str(uuid))
+        return FetchedProfile(
+            uuid=str(resp.uuid),
+            name=getattr(resp, "name", ""),
+            config=resp.config,
+            tag_to_inbound={
+                inb.tag: str(inb.uuid)
+                for inb in (getattr(resp, "inbounds", None) or [])
+                if getattr(inb, "tag", None) is not None
+            },
+        )
+
+    async def update_config_profile(self, uuid: str, config: dict) -> CreatedProfile:
+        """Заменить config профиля целиком и вернуть новую карту tag→inbound_uuid.
+
+        Панель пересобирает inbounds по новому config и присваивает им uuid'ы
+        (они могут смениться), поэтому возвращаем свежую карта тегов — по ней
+        вызывающий код находит uuid именно добавленного inbound'а. Config должен
+        быть ПОЛНЫМ (со всеми прежними inbounds + новым): update заменяет, а не
+        мёржит. Сбор полного config — задача вызывающего кода (read-modify-write
+        поверх get_config_profile)."""
+        body = _build_update_config_profile_request(uuid, config)
+        resp = await self._sdk.config_profiles.update_config_profile(body=body)
+        return CreatedProfile(
+            uuid=str(resp.uuid),
+            tag_to_inbound={
+                inb.tag: str(inb.uuid)
+                for inb in (getattr(resp, "inbounds", None) or [])
+                if getattr(inb, "tag", None) is not None
+            },
         )
 
     async def create_node(

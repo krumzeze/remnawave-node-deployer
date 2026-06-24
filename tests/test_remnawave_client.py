@@ -81,6 +81,24 @@ class _FakeProfiles:
         ]
         return types.SimpleNamespace(uuid="prof-new", name="auto", inbounds=inb)
 
+    async def get_config_profile_by_uuid(self, uuid):
+        # Панель отдаёт полный config (со всеми inbounds) и список inbounds.
+        self.requested_uuid = uuid
+        cfg = {"inbounds": [{"tag": "vless-reality-tcp-1-2-3-4", "port": 443}]}
+        inb = [types.SimpleNamespace(uuid="inb-old", tag="vless-reality-tcp-1-2-3-4")]
+        return types.SimpleNamespace(
+            uuid="prof-1", name="default", config=cfg, inbounds=inb
+        )
+
+    async def update_config_profile(self, body):
+        # После update панель пересобирает inbounds и присваивает им uuid'ы.
+        self.updated_body = body
+        inb = [
+            types.SimpleNamespace(uuid="inb-old", tag="vless-reality-tcp-1-2-3-4"),
+            types.SimpleNamespace(uuid="inb-hy2", tag="hysteria2-1-2-3-4"),
+        ]
+        return types.SimpleNamespace(uuid="prof-1", name="default", inbounds=inb)
+
 
 class _FakeHosts:
     def __init__(self, hosts_resp=None):
@@ -194,6 +212,37 @@ async def test_create_config_profile_maps_tags(monkeypatch):
     assert created.tag_to_inbound == {
         "vless-reality-tcp": "inb-aaa",
         "shadowsocks": "inb-bbb",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_config_profile_returns_full_config():
+    c = _client(_FakeNode())
+    prof = await c.get_config_profile("prof-1")
+    assert prof.uuid == "prof-1"
+    assert prof.name == "default"
+    # Полный config со всеми inbounds приходит как есть — по нему делаем
+    # read-modify-write при добавлении нового инбаунда.
+    assert prof.config["inbounds"][0]["tag"] == "vless-reality-tcp-1-2-3-4"
+    assert prof.tag_to_inbound == {"vless-reality-tcp-1-2-3-4": "inb-old"}
+
+
+@pytest.mark.asyncio
+async def test_update_config_profile_returns_new_tag_map(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(rc, "_build_update_config_profile_request",
+                        lambda *a, **k: sentinel)
+    sdk = _FakeSDK(_FakeNode())
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    created = await c.update_config_profile("prof-1", {"inbounds": []})
+
+    assert sdk.config_profiles.updated_body is sentinel
+    assert created.uuid == "prof-1"
+    # Новая карта тегов содержит и старый инбаунд, и добавленный Hysteria2.
+    assert created.tag_to_inbound == {
+        "vless-reality-tcp-1-2-3-4": "inb-old",
+        "hysteria2-1-2-3-4": "inb-hy2",
     }
 
 
