@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from sqlalchemy import String, Integer, DateTime, ForeignKey, func
+from sqlalchemy import BigInteger, String, DateTime, ForeignKey, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -15,12 +15,31 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    """Пользователь бота (мультитенант, ADR 0014).
+
+    Заводится при первом /start (открытая регистрация). Тенант = этот
+    пользователь: его панели, ноды и секреты изолированы по tg_id. Подписку
+    держим здесь: premium_until — момент, до которого сняты free-лимиты; NULL
+    или прошедшая дата = free-тариф. Оплата продлевает эту дату (Telegram Stars).
+
+    tg_id — BigInteger: Telegram-идентификаторы уже вышли за int32, для
+    публичного бота Integer не годится.
+    """
+    __tablename__ = "users"
+
+    tg_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    is_admin: Mapped[bool] = mapped_column(default=False)
+    premium_until: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class Panel(Base):
     """Панель Remnawave: своя или подключённая (bring-your-own, ADR 0001)."""
     __tablename__ = "panels"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    owner_tg_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner_tg_id: Mapped[int] = mapped_column(BigInteger, index=True)
     url: Mapped[str] = mapped_column(String(512))
     token_vault_path: Mapped[str] = mapped_column(String(512))  # секрет — в Vault
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, server_default=func.now())

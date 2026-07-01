@@ -24,12 +24,19 @@ import re
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 
 from bot import keyboards
-from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, WizCB
+from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, SubCB, WizCB
+from bot.plans import plan_by_days
+from bot.validate import valid_ipv4, valid_login
 from bot.states import AddNode, AdoptNode, SetPanel
 from config import settings
 from orchestrator import domain
@@ -386,6 +393,37 @@ def _owner_of(event: Message | CallbackQuery) -> int:
     return event.from_user.id if event.from_user else 0
 
 
+# Апселл при упоре во free-лимиты (ADR 0014). Текст один на оба лимита (нода и
+# конфиг), различается лишь первой строкой — её подставляем в местах вызова.
+_LIMIT_NODE_TEXT = (
+    "На бесплатном тарифе можно развернуть одну ноду.\n\n"
+    "Оформи подписку, чтобы добавлять больше нод и конфигов."
+)
+_LIMIT_CONFIG_TEXT = (
+    "На бесплатном тарифе — один конфиг на ноду.\n\n"
+    "Оформи подписку, чтобы добавлять больше конфигов."
+)
+
+
+async def _node_limit_ok(sm, owner: int) -> bool:
+    """Можно ли завести ещё одну ноду: премиум — всегда, free — до лимита."""
+    from db.repo import FREE_NODE_LIMIT, count_owner_nodes, get_user, is_premium
+
+    if is_premium(await get_user(sm, owner)):
+        return True
+    return await count_owner_nodes(sm, owner) < FREE_NODE_LIMIT
+
+
+async def _config_add_allowed(sm, owner: int) -> bool:
+    """Можно ли добавить ещё один конфиг на ноду.
+
+    Начальный конфиг ноды есть у всех (FREE_CONFIG_PER_NODE_LIMIT=1), поэтому
+    добавление сверх него — только для подписчиков (ADR 0014)."""
+    from db.repo import get_user, is_premium
+
+    return is_premium(await get_user(sm, owner))
+
+
 async def _render(
     event: Message | CallbackQuery, text: str, kb=None, *, html: bool = False
 ) -> None:
@@ -405,7 +443,8 @@ _MENU_TEXT = (
     "Деплойер нод Remnawave.\n\n"
     "• Добавить ноду — пройти мастер и запустить установку.\n"
     "• Мои ноды — список добавленных нод и их статус.\n"
-    "• Панель — какая панель сейчас привязана."
+    "• Панель — какая панель сейчас привязана.\n"
+    "• Подписка — снять лимиты бесплатного тарифа."
 )
 
 
@@ -416,11 +455,130 @@ async def start(message: Message, state: FSMContext) -> None:
     await message.answer(_MENU_TEXT, reply_markup=keyboards.main_menu())
 
 
+@router.message(Command("dashboard"))
+async def dashboard_link(message: Message) -> None:
+    """Выдать персональную ссылку на веб-дашборд с подписанным токеном (ADR 0014).
+
+    Ссылку показываем, только если веб настроен (задан базовый URL и секрет);
+    иначе честно говорим, что дашборд недоступен."""
+    if not settings.web_base_url or not settings.web_secret:
+        await message.answer("Веб-дашборд не настроен.")
+        return
+    from web.auth import make_token
+
+    token = make_token(_owner_of(message), settings.web_secret)
+    base = settings.web_base_url.rstrip("/")
+    await message.answer(
+        f"Твой дашборд (ссылка личная, не делись ей):\n{base}/nodes?token={token}"
+    )
+
+
 @router.callback_query(MenuCB.filter(F.action == "home"))
 async def menu_home(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await _render(query, _MENU_TEXT, keyboards.main_menu())
     await query.answer()
+
+
+# --------------------------------------------------------------------------
+# Подписка (Telegram Stars, ADR 0014).
+# --------------------------------------------------------------------------
+# Валюта Stars: currency="XTR", provider_token пустой, сумма — целое число
+# звёзд (не копейки). В payload инвойса кладём срок плана — по нему после оплаты
+# сверяем сумму и продлеваем подписку.
+_STARS_CURRENCY = "XTR"
+_INVOICE_PREFIX = "sub:"  # payload инвойса: "sub:<days>"
+
+
+async def _subscription_text(sm, owner: int) -> str:
+    """Текст экрана подписки: текущий статус + приглашение выбрать план."""
+    from db.repo import get_user, is_premium
+
+    user = await get_user(sm, owner)
+    if is_premium(user):
+        until = user.premium_until.strftime("%Y-%m-%d")
+        head = f"Подписка активна до {until}."
+    else:
+        head = "Сейчас у тебя бесплатный тариф: 1 нода и 1 конфиг на ноду."
+    return f"{head}\n\nВыбери план — оплата звёздами Telegram:"
+
+
+@router.callback_query(MenuCB.filter(F.action == "subscribe"))
+async def menu_subscribe(query: CallbackQuery, state: FSMContext) -> None:
+    from db import get_sessionmaker
+
+    await state.clear()
+    text = await _subscription_text(get_sessionmaker(), _owner_of(query))
+    await _render(query, text, keyboards.subscription_kb())
+    await query.answer()
+
+
+@router.callback_query(SubCB.filter())
+async def subscribe_invoice(query: CallbackQuery, callback_data: SubCB) -> None:
+    """Выставить инвойс на выбранный план в Telegram Stars."""
+    plan = plan_by_days(callback_data.days)
+    if plan is None:
+        await query.answer("Неизвестный план.", show_alert=True)
+        return
+    await query.bot.send_invoice(
+        chat_id=query.message.chat.id,
+        title=plan.title,
+        description=f"Снятие лимитов деплойера на {plan.days} дней.",
+        # payload несёт срок — на нём после оплаты сверяем план и сумму.
+        payload=f"{_INVOICE_PREFIX}{plan.days}",
+        provider_token="",            # для Stars пусто
+        currency=_STARS_CURRENCY,
+        prices=[LabeledPrice(label=plan.title, amount=plan.stars)],
+    )
+    await query.answer()
+
+
+@router.pre_checkout_query()
+async def subscribe_precheckout(pre_checkout: PreCheckoutQuery) -> None:
+    """Подтвердить оплату до списания. Валиден только наш payload с известным
+    планом и совпадающей суммой — иначе отклоняем (защита от подделки инвойса)."""
+    payload = pre_checkout.invoice_payload or ""
+    plan = None
+    if payload.startswith(_INVOICE_PREFIX):
+        try:
+            plan = plan_by_days(int(payload[len(_INVOICE_PREFIX):]))
+        except ValueError:
+            plan = None
+    if plan is None or pre_checkout.total_amount != plan.stars:
+        await pre_checkout.answer(ok=False, error_message="Платёж не распознан.")
+        return
+    await pre_checkout.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def subscribe_paid(message: Message) -> None:
+    """Зачесть оплату: продлить подписку на срок плана.
+
+    Срок и сумму берём из плана по payload, а не из присланных клиентом полей —
+    единственный доверенный источник цены здесь наш PLANS. Сумму всё же сверяем
+    (pre_checkout уже проверял, но подтверждаем на всякий случай)."""
+    from db import get_sessionmaker
+    from db.repo import extend_premium
+
+    sp = message.successful_payment
+    payload = sp.invoice_payload or ""
+    plan = None
+    if payload.startswith(_INVOICE_PREFIX):
+        try:
+            plan = plan_by_days(int(payload[len(_INVOICE_PREFIX):]))
+        except ValueError:
+            plan = None
+    if plan is None or sp.total_amount != plan.stars:
+        logger.warning("successful_payment с неизвестным payload=%r", payload)
+        await message.answer("Оплата получена, но план не распознан — напиши в поддержку.")
+        return
+
+    until = await extend_premium(get_sessionmaker(), _owner_of(message), plan.days)
+    logger.info("подписка продлена: owner=%s до %s", _owner_of(message), until)
+    await message.answer(
+        f"Оплата прошла, спасибо! Подписка активна до {until:%Y-%m-%d}.",
+        reply_markup=keyboards.main_menu(),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -614,7 +772,17 @@ async def node_addcfg_start(query: CallbackQuery, callback_data: NodeCB) -> None
     from orchestrator.xray_config import available_choices_for_node
 
     owner = _owner_of(query)
-    node = await get_node_for_owner(get_sessionmaker(), callback_data.node_id, owner)
+    sm = get_sessionmaker()
+
+    # Free-лимит конфигов (ADR 0014): добавление второго конфига на ноду —
+    # премиум-действие. Начальный конфиг ноды остаётся у всех; докидывать ещё
+    # можно только с подпиской.
+    if not await _config_add_allowed(sm, owner):
+        await query.answer()
+        await _render(query, _LIMIT_CONFIG_TEXT, keyboards.subscription_kb())
+        return
+
+    node = await get_node_for_owner(sm, callback_data.node_id, owner)
     if node is None:
         await query.answer("Нода не найдена.", show_alert=True)
         return
@@ -666,7 +834,14 @@ async def node_addcfg_pick(query: CallbackQuery, callback_data: AddCfgCB) -> Non
     from db.repo import get_node_for_owner
 
     owner = _owner_of(query)
-    node = await get_node_for_owner(get_sessionmaker(), callback_data.node_id, owner)
+    sm = get_sessionmaker()
+    # Тот же премиум-гейт, что и на входе (callback можно вызвать из старого
+    # сообщения в обход первого шага) — защита в глубину.
+    if not await _config_add_allowed(sm, owner):
+        await query.answer()
+        await _render(query, _LIMIT_CONFIG_TEXT, keyboards.subscription_kb())
+        return
+    node = await get_node_for_owner(sm, callback_data.node_id, owner)
     if node is None:
         await query.answer("Нода не найдена.", show_alert=True)
         return
@@ -804,9 +979,10 @@ async def node_adopt_start(
 @router.message(AdoptNode.wait_login)
 async def node_adopt_login(message: Message, state: FSMContext) -> None:
     login = (message.text or "").strip()
-    if not login:
+    if not valid_login(login):
         await message.answer(
-            "Пустой логин. Пришли логин (например, root).",
+            "Недопустимый логин. Только латиница, цифры, _ и -, начиная с буквы "
+            "(например, root).",
             reply_markup=keyboards.cancel_only(),
         )
         return
@@ -1057,14 +1233,28 @@ async def wiz_panel_token(message: Message, state: FSMContext) -> None:
 
 @router.message(AddNode.wait_ip)
 async def wiz_ip(message: Message, state: FSMContext) -> None:
-    await state.update_data(ip=(message.text or "").strip())
+    ip = (message.text or "").strip()
+    if not valid_ipv4(ip):
+        await message.answer(
+            "Это не похоже на IPv4-адрес. Пришли адрес вида 203.0.113.10.",
+            reply_markup=keyboards.cancel_only(),
+        )
+        return
+    await state.update_data(ip=ip)
     await state.set_state(AddNode.wait_login)
     await message.answer("SSH-логин (или нажми кнопку для root):", reply_markup=keyboards.login_default())
 
 
 @router.message(AddNode.wait_login)
 async def wiz_login_text(message: Message, state: FSMContext) -> None:
-    await state.update_data(login=(message.text or "").strip() or "root")
+    login = (message.text or "").strip() or "root"
+    if not valid_login(login):
+        await message.answer(
+            "Недопустимый логин. Только латиница, цифры, _ и -, начиная с буквы.",
+            reply_markup=keyboards.login_default(),
+        )
+        return
+    await state.update_data(login=login)
     await state.set_state(AddNode.choose_auth)
     await message.answer("Как заходить на сервер?", reply_markup=keyboards.auth_choice())
 
@@ -1338,9 +1528,18 @@ async def wiz_confirm(query: CallbackQuery, state: FSMContext) -> None:
 
     owner = _owner_of(query)
     ip = data["ip"]
+
+    # Free-лимит нод (ADR 0014): без активной подписки — не больше FREE_NODE_LIMIT.
+    # Проверяем ДО сохранения панели и постановки задачи, чтобы не плодить записи.
+    sm = get_sessionmaker()
+    if not await _node_limit_ok(sm, owner):
+        await state.clear()
+        await _render(query, _LIMIT_NODE_TEXT, keyboards.subscription_kb())
+        await query.answer()
+        return
+
     await _save_panel(owner, data["panel_url"], data.get("panel_token", ""))
 
-    sm = get_sessionmaker()
     token_path = f"panels/{owner}/token"
     panel_id = await get_or_create_panel(
         sm, owner_tg_id=owner, url=data["panel_url"], token_vault_path=token_path

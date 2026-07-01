@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import delete, select
+import datetime as dt
+
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from db.models import AuditLog, Node, Panel
+from db.models import AuditLog, Node, Panel, User
 from db.models import Task as TaskRow
 
 log = logging.getLogger(__name__)
@@ -29,6 +31,88 @@ log = logging.getLogger(__name__)
 # Длина detail в модели Task — 1024. Режем заранее, чтобы длинная ошибка
 # ansible/SDK не уронила вставку.
 _DETAIL_MAX = 1024
+
+# Free-лимиты (ADR 0014): без активной подписки — одна нода и один конфиг на
+# ноду. Сняты при premium_until в будущем.
+FREE_NODE_LIMIT = 1
+FREE_CONFIG_PER_NODE_LIMIT = 1
+
+
+async def upsert_user(
+    session_factory: async_sessionmaker, tg_id: int, *, is_admin: bool = False
+) -> User:
+    """Завести пользователя при первом контакте или вернуть существующего.
+
+    Открытая регистрация (ADR 0014): каждый, кто написал боту, становится
+    тенантом с free-тарифом. Повторный вызов не трогает подписку и дату
+    создания — только гарантирует наличие строки. is_admin проставляем в True
+    лишь для перечисленных в ADMIN_TELEGRAM_IDS (см. вызывающий код); понижать
+    существующего админа не будем, чтобы ручное назначение из БД не сбрасывалось.
+    """
+    async with session_factory() as session:
+        user = await session.get(User, tg_id)
+        if user is not None:
+            if is_admin and not user.is_admin:
+                user.is_admin = True
+                await session.commit()
+            return user
+        user = User(tg_id=tg_id, is_admin=is_admin)
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        return user
+
+
+async def get_user(session_factory: async_sessionmaker, tg_id: int) -> User | None:
+    """Пользователь по tg_id, либо None (ещё не регистрировался)."""
+    async with session_factory() as session:
+        return await session.get(User, tg_id)
+
+
+def is_premium(user: User | None, *, now: dt.datetime | None = None) -> bool:
+    """Активна ли подписка: premium_until в будущем. None/прошлое = free.
+
+    Чистая функция (без БД) — удобно и для проверок в хендлерах, и для тестов.
+    now инъектируется для тестов; по умолчанию — UTC-сейчас."""
+    if user is None or user.premium_until is None:
+        return False
+    moment = now or dt.datetime.utcnow()
+    return user.premium_until > moment
+
+
+async def extend_premium(
+    session_factory: async_sessionmaker, tg_id: int, days: int
+) -> dt.datetime:
+    """Продлить подписку на days дней и вернуть новый premium_until.
+
+    Отсчёт от максимума (текущий premium_until, если он в будущем) и «сейчас» —
+    чтобы оплата поверх активной подписки не сгорала, а прибавлялась. Вызывается
+    из обработчика успешной оплаты (Telegram Stars, ADR 0014)."""
+    async with session_factory() as session:
+        user = await session.get(User, tg_id)
+        if user is None:
+            user = User(tg_id=tg_id)
+            session.add(user)
+        now = dt.datetime.utcnow()
+        base = user.premium_until if (user.premium_until and user.premium_until > now) else now
+        user.premium_until = base + dt.timedelta(days=days)
+        await session.commit()
+        return user.premium_until
+
+
+async def count_owner_nodes(
+    session_factory: async_sessionmaker, owner_tg_id: int
+) -> int:
+    """Сколько нод у владельца (через его панели) — для free-лимита нод."""
+    async with session_factory() as session:
+        return int(
+            await session.scalar(
+                select(func.count(Node.id))
+                .join(Panel, Node.panel_id == Panel.id)
+                .where(Panel.owner_tg_id == owner_tg_id)
+            )
+            or 0
+        )
 
 
 async def get_or_create_panel(

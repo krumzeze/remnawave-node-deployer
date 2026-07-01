@@ -10,7 +10,8 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, WizCB
+from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, SubCB, WizCB
+from bot.plans import PLANS
 from config import settings
 
 # Значок состояния ноды для списка. Состояния — из state-машины провижининга
@@ -45,6 +46,23 @@ def main_menu() -> InlineKeyboardMarkup:
     b.button(text="➕ Добавить ноду", callback_data=MenuCB(action="add"))
     b.button(text="🖥 Мои ноды", callback_data=MenuCB(action="nodes"))
     b.button(text="⚙️ Панель", callback_data=MenuCB(action="panel"))
+    b.button(text="⭐ Подписка", callback_data=MenuCB(action="subscribe"))
+    b.adjust(1)
+    return b.as_markup()
+
+
+def subscription_kb() -> InlineKeyboardMarkup:
+    """Выбор плана подписки: кнопка на каждый план из PLANS (Telegram Stars).
+
+    В callback кладём только срок (days) — по нему обработчик находит план и
+    цену и шлёт инвойс. Так цена не подделывается через callback."""
+    b = InlineKeyboardBuilder()
+    for plan in PLANS:
+        b.button(
+            text=f"⭐ {plan.title} — {plan.stars}",
+            callback_data=SubCB(days=plan.days),
+        )
+    b.button(text="⬅️ В меню", callback_data=MenuCB(action="home"))
     b.adjust(1)
     return b.as_markup()
 
