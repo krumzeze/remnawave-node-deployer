@@ -101,7 +101,9 @@ def test_transport_mapping():
         InboundChoice.VLESS_GRPC_REALITY,
     ])
     by_tag = {o["tag"]: o for o in prof.config["inbounds"]}
-    assert by_tag["vless-reality-tcp"]["streamSettings"]["network"] == "tcp"
+    # reality-tcp — транспорт "raw" (канон Xray/Remnawave; панель по нему
+    # опознаёт инбаунд и добавляет flow xtls-rprx-vision), не "tcp".
+    assert by_tag["vless-reality-tcp"]["streamSettings"]["network"] == "raw"
     assert by_tag["vless-xhttp-reality"]["streamSettings"]["network"] == "xhttp"
     assert by_tag["vless-grpc-reality"]["streamSettings"]["network"] == "grpc"
 

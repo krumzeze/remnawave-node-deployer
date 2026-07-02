@@ -340,10 +340,18 @@ def _build_inbound(choice: InboundChoice, port: int, *, keys: RealityKeys | None
     tag = choice.value
 
     if choice is InboundChoice.VLESS_REALITY_TCP:
+        # Транспорт называем "raw", а не "tcp". Для Xray-core это одно и то же
+        # ("tcp" — исторический алиас raw, инбаунд поднимется и так), но панель
+        # Remnawave распознаёт reality-tcp именно по "raw" и по нему добавляет
+        # клиенту и в подписку flow xtls-rprx-vision (Vision). С "tcp" панель
+        # инбаунд не опознаёт: flow проставляется рассинхронно, reality-хендшейк
+        # проходит, но трафик не проксируется — «подключается, а интернета нет».
+        # Vision совместим только с raw/tcp, поэтому xhttp/grpc reality ниже
+        # остаются на своих транспортах без flow.
         return {
             "tag": tag, "port": port, "protocol": "vless",
             "settings": {"clients": [], "decryption": "none"},
-            "streamSettings": _reality_stream("tcp", keys, dest, server_names),
+            "streamSettings": _reality_stream("raw", keys, dest, server_names),
         }
 
     if choice is InboundChoice.VLESS_XHTTP_REALITY:
