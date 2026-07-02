@@ -153,6 +153,34 @@ async def test_add_hysteria2_reuses_domain_and_opens_udp():
 
 
 @pytest.mark.asyncio
+async def test_add_reality_inbound_reuses_node_donor():
+    # Нода разворачивалась с кастомным донором Reality — добавляемый Reality-
+    # инбаунд должен взять его же (dest/serverNames и sni хоста), а не дефолт.
+    config = {
+        "inbounds": [
+            {"tag": "vless-reality-tcp-1-2-3-4", "port": 443,
+             "streamSettings": {
+                 "security": "reality",
+                 "realitySettings": {
+                     "dest": "www.cloudflare.com:443",
+                     "serverNames": ["www.cloudflare.com"],
+                 },
+             }},
+        ]
+    }
+    res, client, op = await _run(InboundChoice.VLESS_GRPC_REALITY, config)
+    assert res.ok, res.detail
+    new_inb = next(
+        i for i in client.updated_config["inbounds"]
+        if i["tag"] == "vless-grpc-reality-1-2-3-4"
+    )
+    rs = new_inb["streamSettings"]["realitySettings"]
+    assert rs["dest"] == "www.cloudflare.com:443"
+    assert rs["serverNames"] == ["www.cloudflare.com"]
+    assert client.created_hosts[0]["sni"] == "www.cloudflare.com"
+
+
+@pytest.mark.asyncio
 async def test_domain_inbound_rejected_without_domain():
     res, client, op = await _run(InboundChoice.HYSTERIA2, _reality_config())
     assert res.ok is False

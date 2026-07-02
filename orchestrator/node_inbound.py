@@ -30,6 +30,7 @@ from orchestrator.xray_config import (
     PORT_443,
     FALLBACK_PORTS,
     InboundChoice,
+    REALITY_CHOICES,
     TLS_CHOICES,
 )
 
@@ -42,21 +43,29 @@ class AddInboundResult:
     detail: str
 
 
-def _used_ports(config: dict) -> set[int]:
-    """Порты, уже занятые инбаундами профиля — чтобы новый не сел на тот же."""
-    ports: set[int] = set()
-    for inb in config.get("inbounds", []) or []:
-        p = inb.get("port")
-        if isinstance(p, int):
-            ports.add(p)
-    return ports
-
-
 def _free_port(used: set[int]) -> int | None:
     """Первый свободный порт из того же пула, что и при провижине (443 → фолбэки)."""
     for p in (PORT_443, *FALLBACK_PORTS):
         if p not in used:
             return p
+    return None
+
+
+def _extract_reality_donor(config: dict) -> tuple[str, tuple[str, ...]] | None:
+    """Достать (dest, serverNames) из первого Reality-инбаунда профиля.
+
+    Донор Reality — per-node (ADR 0007): если нода разворачивалась с кастомным
+    донором, добавляемый Reality-инбаунд должен использовать его же, а не дефолт
+    генератора. Нет Reality-инбаундов — None (возьмётся дефолт)."""
+    for inb in config.get("inbounds", []) or []:
+        ss = inb.get("streamSettings") or {}
+        if ss.get("security") != "reality":
+            continue
+        rs = ss.get("realitySettings") or {}
+        dest = rs.get("dest") or rs.get("target")
+        names = rs.get("serverNames") or []
+        if dest and names:
+            return dest, tuple(names)
     return None
 
 
@@ -106,7 +115,7 @@ async def add_inbound_to_node(
     profile = await client.get_config_profile(node_cfg.profile_uuid)
     config = profile.config
 
-    used = _used_ports(config)
+    used = xray_config.used_ports(config)
     new_port = _free_port(used)
     if new_port is None:
         return AddInboundResult(False, "Нет свободного порта для нового инбаунда.")
@@ -122,6 +131,17 @@ async def add_inbound_to_node(
             )
         tls_domain, cert_file, key_file = tls
 
+    # Донор Reality — тот же, что у существующих Reality-инбаундов ноды (если
+    # они есть): нода могла разворачиваться с кастомным донором (ADR 0007).
+    donor_kwargs: dict = {}
+    if choice in REALITY_CHOICES:
+        donor = _extract_reality_donor(config)
+        if donor is not None:
+            donor_kwargs = {
+                "reality_dest": donor[0],
+                "reality_server_names": donor[1],
+            }
+
     # 3. Генерируем один inbound на свободном порту, тегами per-node (как провижн).
     tag_suffix = ip.replace(".", "-")
     generated = xray_config.build_profile(
@@ -129,6 +149,7 @@ async def add_inbound_to_node(
         tls_domain=tls_domain, cert_file=cert_file, key_file=key_file,
         port_overrides={choice: new_port},
         tag_suffix=tag_suffix,
+        **donor_kwargs,
     )
     new_tag = generated.tags[0]
     new_inbound = generated.config["inbounds"][0]
