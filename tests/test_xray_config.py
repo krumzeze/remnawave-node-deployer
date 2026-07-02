@@ -130,6 +130,23 @@ def test_tls_inbound_uses_domain_and_cert_paths():
     assert prof.reality_keys == {}
 
 
+def test_ws_alpn_http11_only():
+    # WebSocket не работает поверх h2: ws-инбаунд обязан объявлять только
+    # http/1.1, иначе клиент, отнегошиировав h2, не подключится. Остальным
+    # TLS-инбаундам h2 оставляем.
+    prof = build_profile(
+        [InboundChoice.VLESS_XHTTP_TLS, InboundChoice.TROJAN_WS_TLS],
+        tls_domain="vpn.example.com",
+        cert_file="/c/fullchain.pem",
+        key_file="/c/key.pem",
+    )
+    by_proto = {i["protocol"]: i for i in prof.config["inbounds"]}
+    assert by_proto["trojan"]["streamSettings"]["tlsSettings"]["alpn"] == ["http/1.1"]
+    assert by_proto["vless"]["streamSettings"]["tlsSettings"]["alpn"] == [
+        "h2", "http/1.1",
+    ]
+
+
 def test_reserved_ports_are_skipped():
     # Повторный провижн: порты существующего профиля исключаются из раздачи —
     # первый инбаунд не садится на занятый 443, а берёт следующий из пула.

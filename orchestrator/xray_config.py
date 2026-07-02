@@ -309,15 +309,20 @@ def _reality_stream(network: str, keys: RealityKeys, dest: str,
 
 
 def _tls_stream(network: str, domain: str, cert_file: str, key_file: str,
-                extra: dict | None = None) -> dict:
+                extra: dict | None = None,
+                alpn: list[str] | None = None) -> dict:
     """streamSettings для TLS-инбаунда. Сертификат — файлы acme.sh на ноде
-    (HTTP-01, см. ADR 0005); пути параметризуются вызывающим кодом."""
+    (HTTP-01, см. ADR 0005); пути параметризуются вызывающим кодом.
+
+    alpn по умолчанию h2+http/1.1; ws-транспорт обязан передать только
+    http/1.1 — WebSocket-апгрейд поверх h2 не работает, и клиент, отнегошиировав
+    h2, не подключится."""
     stream = {
         "network": network,
         "security": "tls",
         "tlsSettings": {
             "serverName": domain,
-            "alpn": ["h2", "http/1.1"],
+            "alpn": list(alpn) if alpn else ["h2", "http/1.1"],
             "certificates": [
                 {"certificateFile": cert_file, "keyFile": key_file},
             ],
@@ -378,6 +383,7 @@ def _build_inbound(choice: InboundChoice, port: int, *, keys: RealityKeys | None
             "streamSettings": _tls_stream(
                 "ws", tls_domain, cert_file, key_file,
                 extra={"wsSettings": {"path": "/"}},
+                alpn=["http/1.1"],
             ),
         }
 
