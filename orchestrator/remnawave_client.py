@@ -672,6 +672,10 @@ class RemnawaveClient:
             port=resp.port,
         )
 
+    async def delete_host(self, uuid: str) -> None:
+        """Удалить хост панели (при удалении инбаунда с ноды)."""
+        await self._sdk.hosts.delete_host(uuid=str(uuid))
+
     async def list_internal_squads(self) -> list[InternalSquadRef]:
         """Внутренние сквады панели с их инбаундами (для выбора в боте и для
         read-modify-write при привязке)."""
@@ -704,4 +708,20 @@ class RemnawaveClient:
                 raise ValueError(f"внутренний сквад {su} не найден в панели")
             merged = list(dict.fromkeys(squad.inbound_uuids + add))
             body = _build_update_squad_request(squad.uuid, merged)
+            await self._sdk.internal_squads.update_internal_squad(body=body)
+
+    async def remove_inbounds_from_squads(self, inbound_uuids: list[str]) -> None:
+        """Убрать инбаунды из всех сквадов, где они состоят (read-modify-write).
+
+        Обратная операция к add_inbounds_to_squads — при удалении инбаунда с
+        ноды. Сквады, не содержащие инбаунд, не трогаем (без пустых update'ов).
+        """
+        if not inbound_uuids:
+            return
+        drop = {str(u) for u in inbound_uuids}
+        for squad in await self.list_internal_squads():
+            kept = [u for u in squad.inbound_uuids if u not in drop]
+            if len(kept) == len(squad.inbound_uuids):
+                continue
+            body = _build_update_squad_request(squad.uuid, kept)
             await self._sdk.internal_squads.update_internal_squad(body=body)

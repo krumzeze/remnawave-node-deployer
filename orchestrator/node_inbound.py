@@ -217,6 +217,120 @@ async def add_inbound_to_node(
     return AddInboundResult(True, f"Инбаунд добавлен на порт {new_port}.")
 
 
+@dataclass
+class RemoveInboundResult:
+    ok: bool
+    detail: str
+
+
+def _host_matches_inbound(host, *, inbound_uuid: str | None, port: int | None,
+                          addresses: set[str]) -> bool:
+    """Относится ли хост панели к удаляемому инбаунду.
+
+    Надёжный признак — uuid инбаунда; если у хоста его нет (форма ответа SDK
+    не зафиксирована), сверяем порт и адрес (IP ноды или её TLS-домен), чтобы
+    не зацепить хосты чужих нод на том же порту."""
+    if host.inbound_uuid is not None and inbound_uuid is not None:
+        return host.inbound_uuid == str(inbound_uuid)
+    return port is not None and host.port == port and host.address in addresses
+
+
+async def remove_inbound_from_node(
+    *,
+    choice: InboundChoice,
+    ip: str,
+    node_uuid: str,
+    ssh_login: str,
+    ssh_private_key: str | None,
+    client,
+    close_port: Callable[..., Awaitable] | None = None,
+) -> RemoveInboundResult:
+    """Удалить инбаунд `choice` с ноды вместе со всем связанным.
+
+    Порядок — обратный добавлению: хосты подписки → членство в сквадах →
+    инбаунд из config'а профиля (update заменяет config целиком) → активные
+    инбаунды ноды → закрытие порта в UFW по SSH. Панель чистится даже без
+    SSH-ключа (импортированная нода) — тогда порт остаётся открыт, о чём
+    честно сообщаем. Профиль предполагается per-node (ADR 0006: бот сам
+    создаёт профиль на каждую ноду).
+    """
+    node_cfg = await client.get_node_config(node_uuid)
+    if not node_cfg.profile_uuid:
+        return RemoveInboundResult(False, "У ноды не определён профиль конфигурации.")
+    profile = await client.get_config_profile(node_cfg.profile_uuid)
+    config = profile.config
+    inbounds = config.get("inbounds", []) or []
+
+    target = next(
+        (i for i in inbounds
+         if xray_config.base_choice_from_tag(i.get("tag") or "") is choice),
+        None,
+    )
+    if target is None:
+        return RemoveInboundResult(False, "Такого конфига на ноде нет.")
+    if len(inbounds) <= 1:
+        return RemoveInboundResult(
+            False, "Это последний конфиг ноды — без него нода бесполезна. "
+            "Сначала добавь другой конфиг или удали ноду целиком.",
+        )
+
+    tag = target.get("tag")
+    inbound_uuid = profile.tag_to_inbound.get(tag)
+    port = target.get("port") if isinstance(target.get("port"), int) else None
+    is_udp = choice in (InboundChoice.SHADOWSOCKS, InboundChoice.HYSTERIA2)
+    # Адреса, под которыми хост этого инбаунда мог быть заведён: IP ноды и её
+    # TLS-домен (для доменных инбаундов хост создаётся на домен, не на IP).
+    addresses = {ip}
+    tls_domain = ((target.get("streamSettings") or {}).get("tlsSettings") or {}).get("serverName")
+    if tls_domain:
+        addresses.add(tls_domain)
+
+    # 1. Хосты подписки: пользователи перестают видеть эту точку входа.
+    removed_hosts = 0
+    for host in await client.list_hosts():
+        if _host_matches_inbound(
+            host, inbound_uuid=inbound_uuid, port=port, addresses=addresses,
+        ):
+            await client.delete_host(host.uuid)
+            removed_hosts += 1
+
+    # 2. Членство в сквадах (пока uuid инбаунда ещё жив).
+    if inbound_uuid:
+        await client.remove_inbounds_from_squads([inbound_uuid])
+
+    # 3. Инбаунд из config'а профиля. Панель пересобирает uuid'ы — карта свежая.
+    config["inbounds"] = [i for i in inbounds if i.get("tag") != tag]
+    updated = await client.update_config_profile(node_cfg.profile_uuid, config)
+
+    # 4. Активные инбаунды ноды: прежний набор минус удалённый, uuid'ы — из
+    # свежей карты (после update они могли смениться).
+    uuid_to_tag = {v: k for k, v in profile.tag_to_inbound.items()}
+    active_tags = [uuid_to_tag.get(u) for u in node_cfg.active_inbound_uuids]
+    new_active = [
+        updated.tag_to_inbound[t]
+        for t in active_tags
+        if t and t != tag and t in updated.tag_to_inbound
+    ]
+    await client.update_node_active_inbounds(
+        node_uuid, node_cfg.profile_uuid, new_active
+    )
+
+    # 5. Порт в UFW. Не критично для панели, поэтому сбой не отменяет удаление —
+    # но оператору сообщаем, чтобы закрыл вручную.
+    tail = ""
+    if port is not None and close_port is not None and ssh_private_key:
+        res = await close_port(ip, ssh_login, ssh_private_key, port, udp=is_udp)
+        if not getattr(res, "ok", False):
+            tail = (f" Порт {port} закрыть не вышло "
+                    f"({getattr(res, 'detail', '')}) — закрой вручную.")
+    elif port is not None:
+        tail = f" Порт {port} остался открыт в UFW (нет SSH-доступа к ноде)."
+
+    return RemoveInboundResult(
+        True, f"Конфиг удалён; хостов из подписки убрано: {removed_hosts}.{tail}"
+    )
+
+
 def xray_config_host_remark(country_code: str, hint) -> str:
     """Remark host'а — переиспользуем формат из tasks (флаг страны · отпечаток).
 

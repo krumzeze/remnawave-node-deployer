@@ -129,6 +129,25 @@ async def test_listening_ports_none_on_failure(patch_ssh):
     assert await node_ops.listening_ports("1.2.3.4", "root", "PRIV") is None
 
 
+def test_ufw_delete_cmd_tcp_and_udp():
+    # Зеркально _ufw_allow_cmd: tcp всегда, udp добавляется вторым правилом.
+    assert node_ops._ufw_delete_cmd(8443, udp=False) == "ufw delete allow 8443/tcp"
+    assert node_ops._ufw_delete_cmd(443, udp=True) == (
+        "ufw delete allow 443/tcp && ufw delete allow 443/udp"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_port_runs_ufw_delete(patch_ssh):
+    conn = FakeConn(FakeRun(exit_status=0))
+    patch_ssh(conn=conn)
+
+    res = await node_ops.close_port("1.2.3.4", "root", "PRIV", 8443)
+    assert res.ok
+    assert conn.cmd == "ufw delete allow 8443/tcp"
+    assert "закрыт" in res.detail
+
+
 def test_ufw_allow_cmd_tcp_and_udp():
     # tcp открывается всегда; udp=True добавляет udp-правило, не заменяя tcp
     # (Shadowsocks слушает tcp,udp — раньше tcp оставался закрыт).

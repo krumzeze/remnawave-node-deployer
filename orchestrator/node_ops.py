@@ -159,6 +159,34 @@ def _ufw_allow_cmd(inbound_port: int, *, udp: bool) -> str:
     return cmd
 
 
+def _ufw_delete_cmd(inbound_port: int, *, udp: bool) -> str:
+    """Команда закрытия порта в UFW (обратная _ufw_allow_cmd).
+
+    `ufw delete allow` по несуществующему правилу выходит с кодом 0 («Could not
+    delete non-existent rule») — повторное закрытие безопасно."""
+    cmd = f"ufw delete allow {int(inbound_port)}/tcp"
+    if udp:
+        cmd += f" && ufw delete allow {int(inbound_port)}/udp"
+    return cmd
+
+
+async def close_port(
+    ip: str, login: str, private_key: str, inbound_port: int, *,
+    udp: bool = False, port: int = 22,
+) -> OpResult:
+    """Закрыть порт инбаунда в UFW ноды (при удалении инбаунда с ноды).
+
+    Зеркально open_port: tcp закрывается всегда, udp=True добавляет udp
+    (Hysteria2, Shadowsocks)."""
+    res = await _connect_run(
+        ip, login, private_key, _ufw_delete_cmd(inbound_port, udp=udp), port=port
+    )
+    if res.ok:
+        proto = "tcp+udp" if udp else "tcp"
+        return OpResult(ok=True, detail=f"Порт {inbound_port}/{proto} закрыт.")
+    return res
+
+
 async def open_port(
     ip: str, login: str, private_key: str, inbound_port: int, *,
     udp: bool = False, port: int = 22,

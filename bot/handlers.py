@@ -29,7 +29,7 @@ from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 
 from bot import keyboards
-from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, WizCB
+from bot.callbacks import AddCfgCB, DelCfgCB, MenuCB, NodeCB, PanelCB, WizCB
 from bot.states import AddNode, AdoptNode, SetPanel
 from config import settings
 from orchestrator import domain
@@ -52,6 +52,8 @@ INBOUND_MENU: tuple[tuple[str, InboundChoice, str], ...] = (
     ("7", InboundChoice.HYSTERIA2, "Hysteria2 (нужен домен)"),
 )
 _MENU_BY_NUMBER = {num: choice for num, choice, _ in INBOUND_MENU}
+_LABEL_BY_CHOICE = {choice: label for _, choice, label in INBOUND_MENU}
+_NUM_BY_CHOICE = {choice: num for num, choice, _ in INBOUND_MENU}
 
 # Код страны ноды: ровно две буквы (ISO 3166-1 alpha-2). Существование кода не
 # проверяем — панели важен формат, на UX-уровне этого достаточно.
@@ -700,6 +702,144 @@ async def node_addcfg_pick(query: CallbackQuery, callback_data: AddCfgCB) -> Non
     except Exception as exc:  # noqa: BLE001 — сбой добавления не должен ронять бот
         logger.warning("addcfg: добавление инбаунда на ноду %s упало: %s", node.id, exc)
         detail = f"Не удалось добавить инбаунд: {exc}"
+
+    await _render(
+        query, detail,
+        keyboards.node_actions(node.id, has_ssh=node.ssh_key_vault_path is not None),
+    )
+    await query.answer()
+
+
+# --------------------------------------------------------------------------
+# Просмотр и удаление конфигов (инбаундов) ноды.
+# --------------------------------------------------------------------------
+async def _node_profile_for_screen(query, node_id: int):
+    """Нода + клиент панели + её профиль для экранов «Конфиги».
+
+    Возвращает (node, client, profile) либо None — тогда пользователю уже
+    показан alert с причиной. Общий пролог трёх обработчиков ниже."""
+    from db import get_sessionmaker
+    from db.repo import get_node_for_owner
+
+    owner = _owner_of(query)
+    node = await get_node_for_owner(get_sessionmaker(), node_id, owner)
+    if node is None:
+        await query.answer("Нода не найдена.", show_alert=True)
+        return None
+    if not node.remnawave_uuid:
+        await query.answer("Нода не зарегистрирована в панели.", show_alert=True)
+        return None
+    saved = await _load_saved_panel(owner)
+    if not saved:
+        await query.answer("Не удалось прочитать панель из Vault.", show_alert=True)
+        return None
+    url, token = saved
+    try:
+        client = _make_client(url, token)
+        node_cfg = await client.get_node_config(node.remnawave_uuid)
+        if not node_cfg.profile_uuid:
+            await query.answer(
+                "У ноды не определён профиль конфигурации.", show_alert=True
+            )
+            return None
+        profile = await client.get_config_profile(node_cfg.profile_uuid)
+    except Exception as exc:  # noqa: BLE001 — недоступность панели не должна ронять экран
+        logger.warning("cfgs: не прочитать профиль ноды %s: %s", node_id, exc)
+        await query.answer("Панель недоступна, попробуй позже.", show_alert=True)
+        return None
+    return node, client, profile
+
+
+@router.callback_query(NodeCB.filter(F.action == "cfgs"))
+async def node_configs(query: CallbackQuery, callback_data: NodeCB) -> None:
+    """Показать, какие конфиги (инбаунды) развёрнуты на ноде, с удалением."""
+    from orchestrator.xray_config import base_choice_from_tag
+
+    ctx = await _node_profile_for_screen(query, callback_data.node_id)
+    if ctx is None:
+        return
+    node, _, profile = ctx
+
+    lines: list[str] = []
+    items: list[tuple[str, str, int]] = []
+    for inb in profile.config.get("inbounds", []) or []:
+        tag = inb.get("tag") or "?"
+        port = inb.get("port")
+        choice = base_choice_from_tag(tag)
+        label = _LABEL_BY_CHOICE.get(choice, tag)
+        lines.append(f"• {label} — порт {port}")
+        num = _NUM_BY_CHOICE.get(choice)
+        if num is not None:
+            # Неопознанный тег (заведён руками, не ботом) удалению кнопкой не
+            # подлежит — он остаётся только строкой в тексте экрана.
+            items.append((num, label, port))
+
+    if not lines:
+        text = f"На ноде {node.ip} нет ни одного конфига."
+    else:
+        text = f"Конфиги ноды {node.ip}:\n" + "\n".join(lines)
+        if items:
+            text += "\n\nНажми на конфиг, чтобы удалить его:"
+    await _render(query, text, keyboards.node_configs_kb(node.id, items))
+    await query.answer()
+
+
+@router.callback_query(DelCfgCB.filter(F.stage == "pick"))
+async def node_delcfg_confirm(query: CallbackQuery, callback_data: DelCfgCB) -> None:
+    choice = _MENU_BY_NUMBER.get(callback_data.num)
+    if choice is None:
+        await query.answer("Неизвестный конфиг.", show_alert=True)
+        return
+    label = _LABEL_BY_CHOICE.get(choice, "конфиг")
+    await _render(
+        query,
+        f"Удалить «{label}» с ноды?\n"
+        "Удалится хост из подписки, инбаунд выйдет из сквадов и профиля, "
+        "порт закроется в UFW. Пользователи потеряют эту точку входа.",
+        keyboards.del_inbound_confirm(callback_data.node_id, callback_data.num),
+    )
+    await query.answer()
+
+
+@router.callback_query(DelCfgCB.filter(F.stage == "go"))
+async def node_delcfg_go(query: CallbackQuery, callback_data: DelCfgCB) -> None:
+    """Выполнить удаление конфига (inline, как добавление)."""
+    from db import get_sessionmaker
+    from db.repo import get_node_for_owner
+
+    owner = _owner_of(query)
+    node = await get_node_for_owner(get_sessionmaker(), callback_data.node_id, owner)
+    if node is None:
+        await query.answer("Нода не найдена.", show_alert=True)
+        return
+    choice = _MENU_BY_NUMBER.get(callback_data.num)
+    if choice is None:
+        await query.answer("Неизвестный конфиг.", show_alert=True)
+        return
+    saved = await _load_saved_panel(owner)
+    if not saved:
+        await query.answer("Не удалось прочитать панель из Vault.", show_alert=True)
+        return
+    url, token = saved
+    # Ключ может отсутствовать (импортированная нода): панель всё равно чистим,
+    # порт тогда останется открыт — remove_inbound_from_node сам об этом скажет.
+    priv, login = _read_node_ssh(node.id)
+
+    await _render(query, f"Удаляю конфиг с {node.ip}…")
+    from orchestrator import node_ops
+    from orchestrator.node_inbound import remove_inbound_from_node
+
+    try:
+        client = _make_client(url, token)
+        res = await remove_inbound_from_node(
+            choice=choice, ip=node.ip, node_uuid=node.remnawave_uuid,
+            ssh_login=login, ssh_private_key=priv,
+            client=client, close_port=node_ops.close_port,
+        )
+        detail = res.detail
+    except Exception as exc:  # noqa: BLE001 — сбой удаления не должен ронять бот
+        logger.warning("delcfg: удаление конфига ноды %s упало: %s", node.id, exc)
+        detail = f"Не удалось удалить конфиг: {exc}"
 
     await _render(
         query, detail,

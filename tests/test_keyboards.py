@@ -8,7 +8,7 @@ from __future__ import annotations
 from aiogram.filters.callback_data import CallbackData
 
 from bot import handlers, keyboards
-from bot.callbacks import AddCfgCB, MenuCB, NodeCB, WizCB
+from bot.callbacks import AddCfgCB, DelCfgCB, MenuCB, NodeCB, WizCB
 from bot.handlers import INBOUND_MENU
 
 
@@ -71,6 +71,39 @@ def test_node_actions_shows_adopt_only_without_ssh():
     # «Добавить конфиг» доступно только при SSH (нужно открыть порт).
     assert "addcfg" in withssh
     assert "addcfg" not in without
+    # «Конфиги» (просмотр/удаление) — в обоих случаях: чтение панели без SSH.
+    assert "cfgs" in withssh and "cfgs" in without
+
+
+def test_node_configs_kb_carries_delete_targets():
+    markup = keyboards.node_configs_kb(
+        42, [("1", "VLESS + Reality (TCP)", 443), ("6", "Shadowsocks", 2053)]
+    )
+    picks = [
+        DelCfgCB.unpack(b.callback_data)
+        for b in _all_buttons(markup)
+        if b.callback_data.startswith("dc:")
+    ]
+    assert [(p.node_id, p.num, p.stage) for p in picks] == [
+        (42, "1", "pick"), (42, "6", "pick"),
+    ]
+
+
+def test_del_inbound_confirm_has_go_and_cancel():
+    markup = keyboards.del_inbound_confirm(42, "1")
+    go = [
+        DelCfgCB.unpack(b.callback_data)
+        for b in _all_buttons(markup)
+        if b.callback_data.startswith("dc:")
+    ]
+    assert [(p.node_id, p.num, p.stage) for p in go] == [(42, "1", "go")]
+    # Отмена возвращает на экран конфигов ноды.
+    cancels = [
+        NodeCB.unpack(b.callback_data)
+        for b in _all_buttons(markup)
+        if b.callback_data.startswith("n:")
+    ]
+    assert [(c.action, c.node_id) for c in cancels] == [("cfgs", 42)]
 
 
 def test_add_inbound_kb_carries_node_and_num():

@@ -10,7 +10,7 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.callbacks import AddCfgCB, MenuCB, NodeCB, PanelCB, WizCB
+from bot.callbacks import AddCfgCB, DelCfgCB, MenuCB, NodeCB, PanelCB, WizCB
 from config import settings
 
 # Значок состояния ноды для списка. Состояния — из state-машины провижининга
@@ -76,6 +76,10 @@ def node_actions(node_id: int, *, has_ssh: bool = True) -> InlineKeyboardMarkup:
     она даёт ноде SSH-доступ, после чего ей можно управлять (ADR 0013)."""
     b = InlineKeyboardBuilder()
     b.button(text="🔄 Обновить статус", callback_data=NodeCB(action="refresh", node_id=node_id))
+    # Просмотр развёрнутых конфигов доступен любой зарегистрированной ноде:
+    # для чтения панели SSH не нужен (удаление без SSH оставит порт открытым,
+    # но панель вычистит — это лучше, чем прятать раздел целиком).
+    b.button(text="🗂 Конфиги", callback_data=NodeCB(action="cfgs", node_id=node_id))
     if has_ssh:
         # Управление по SSH-ключу (ADR 0013): лёгкий рестарт и тяжёлый ребут.
         # «Добавить конфиг» тоже требует SSH (открыть порт инбаунда в UFW).
@@ -100,6 +104,34 @@ def add_inbound_kb(node_id: int, options) -> InlineKeyboardMarkup:
     for num, label in options:
         b.button(text=label, callback_data=AddCfgCB(node_id=node_id, num=num))
     b.button(text="↩️ Отмена", callback_data=NodeCB(action="open", node_id=node_id))
+    b.adjust(1)
+    return b.as_markup()
+
+
+def node_configs_kb(node_id: int, items) -> InlineKeyboardMarkup:
+    """Экран «Конфиги ноды»: по кнопке удаления на каждый развёрнутый инбаунд.
+
+    items — список (num, label, port); num — номер пункта INBOUND_MENU
+    (инбаунды с неопознанным тегом сюда не попадают — их не удалить кнопкой,
+    они остаются только в тексте экрана)."""
+    b = InlineKeyboardBuilder()
+    for num, label, port in items:
+        b.button(
+            text=f"🗑 {label} · порт {port}",
+            callback_data=DelCfgCB(node_id=node_id, num=num, stage="pick"),
+        )
+    b.button(text="↩️ Назад", callback_data=NodeCB(action="open", node_id=node_id))
+    b.adjust(1)
+    return b.as_markup()
+
+
+def del_inbound_confirm(node_id: int, num: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(
+        text="❌ Да, удалить конфиг",
+        callback_data=DelCfgCB(node_id=node_id, num=num, stage="go"),
+    )
+    b.button(text="↩️ Отмена", callback_data=NodeCB(action="cfgs", node_id=node_id))
     b.adjust(1)
     return b.as_markup()
 

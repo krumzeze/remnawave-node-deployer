@@ -142,6 +142,11 @@ class _FakeHosts:
     async def get_all_hosts(self):
         return self._hosts_resp
 
+    async def delete_host(self, uuid):
+        self.deleted = getattr(self, "deleted", [])
+        self.deleted.append(uuid)
+        return types.SimpleNamespace(is_deleted=True)
+
 
 class _FakeSquads:
     def __init__(self):
@@ -521,3 +526,34 @@ async def test_add_inbounds_to_squads_noop_on_empty():
     await c.add_inbounds_to_squads([], ["inb-1"])
     await c.add_inbounds_to_squads(["sq-1"], [])
     assert sdk.internal_squads.updated == []
+
+
+@pytest.mark.asyncio
+async def test_remove_inbounds_from_squads_touches_only_members(monkeypatch):
+    # Обратная операция к add: инбаунд убирается из сквадов, где он есть;
+    # сквады без него не получают пустых update'ов.
+    monkeypatch.setattr(rc, "_build_update_squad_request",
+                        lambda uuid, inbounds: (uuid, list(inbounds)))
+    sdk = _FakeSDK(_FakeNode())
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+
+    await c.remove_inbounds_from_squads(["inb-x"])
+
+    # inb-x был только в sq-1 → один update с пустым остатком; sq-2 не тронут.
+    assert sdk.internal_squads.updated == [("sq-1", [])]
+
+
+@pytest.mark.asyncio
+async def test_remove_inbounds_from_squads_noop_on_empty():
+    sdk = _FakeSDK(_FakeNode())
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+    await c.remove_inbounds_from_squads([])
+    assert sdk.internal_squads.updated == []
+
+
+@pytest.mark.asyncio
+async def test_delete_host_passes_uuid():
+    sdk = _FakeSDK(_FakeNode())
+    c = RemnawaveClient("https://panel.example", "tok", sdk=sdk)
+    await c.delete_host("host-1")
+    assert sdk.hosts.deleted == ["host-1"]

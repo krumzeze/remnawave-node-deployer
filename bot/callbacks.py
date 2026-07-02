@@ -30,6 +30,17 @@ class AddCfgCB(CallbackData, prefix="ac"):
     num: str  # номер пункта меню inbound'ов, либо "cancel"
 
 
+class DelCfgCB(CallbackData, prefix="dc"):
+    """Удаление инбаунда с ноды из экрана «Конфиги».
+
+    num — номер пункта INBOUND_MENU базового типа инбаунда: каждый тип живёт на
+    ноде в одном экземпляре, так что номера достаточно (длинный тег в callback
+    не влезает). stage: pick — показать подтверждение, go — удалить."""
+    node_id: int
+    num: str
+    stage: str  # pick | go
+
+
 class PanelCB(CallbackData, prefix="p"):
     """Раздел управления сохранённой панелью."""
     action: str  # change
