@@ -101,9 +101,10 @@ def test_transport_mapping():
         InboundChoice.VLESS_GRPC_REALITY,
     ])
     by_tag = {o["tag"]: o for o in prof.config["inbounds"]}
-    # reality-tcp — транспорт "raw" (канон Xray/Remnawave; панель по нему
-    # опознаёт инбаунд и добавляет flow xtls-rprx-vision), не "tcp".
-    assert by_tag["vless-reality-tcp"]["streamSettings"]["network"] == "raw"
+    # reality-tcp — транспорт "tcp": на нашей версии панели Remnawave только по
+    # literal "tcp" клиентам проставляется flow xtls-rprx-vision (с "raw" ссылка
+    # получает Vision, а серверные клиенты — нет, и строгий клиент не работает).
+    assert by_tag["vless-reality-tcp"]["streamSettings"]["network"] == "tcp"
     assert by_tag["vless-xhttp-reality"]["streamSettings"]["network"] == "xhttp"
     assert by_tag["vless-grpc-reality"]["streamSettings"]["network"] == "grpc"
 
