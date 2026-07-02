@@ -99,13 +99,18 @@ async def reboot_server(
 
 def _ufw_allow_cmd(inbound_port: int, *, udp: bool) -> str:
     """Команда открытия порта в UFW. Идемпотентна: ufw allow повторно не плодит
-    правил. Для UDP-инбаунда (Hysteria2/Shadowsocks) открываем udp, иначе tcp.
+    правил. tcp открываем всегда (как и полный провижн — он открывает tcp всем
+    инбаундам); udp=True добавляет правило udp для инбаундов, слушающих и его
+    (Shadowsocks — network tcp,udp; Hysteria2 — QUIC). Раньше udp=True заменял
+    tcp-правило, и добавленный кнопкой Shadowsocks оставался закрыт по tcp.
 
     Если UFW на ноде неактивен (например, кастомная нода без него) — `ufw allow`
     всё равно вернёт 0 (правило просто запишется и применится при включении), так
     что отдельный инбаунд это не ломает."""
-    proto = "udp" if udp else "tcp"
-    return f"ufw allow {int(inbound_port)}/{proto}"
+    cmd = f"ufw allow {int(inbound_port)}/tcp"
+    if udp:
+        cmd += f" && ufw allow {int(inbound_port)}/udp"
+    return cmd
 
 
 async def open_port(
@@ -114,12 +119,13 @@ async def open_port(
 ) -> OpResult:
     """Открыть порт инбаунда в UFW ноды (для добавления инбаунда к ноде).
 
-    udp=True для QUIC/UDP-инбаундов (Hysteria2) и Shadowsocks. Возвращает OpResult:
-    при сбое подключения — то же понятное «сервер недоступен», что и у restart."""
+    tcp открывается всегда; udp=True добавляет udp (Hysteria2, Shadowsocks).
+    Возвращает OpResult: при сбое подключения — то же понятное «сервер
+    недоступен», что и у restart."""
     res = await _connect_run(
         ip, login, private_key, _ufw_allow_cmd(inbound_port, udp=udp), port=port
     )
     if res.ok:
-        proto = "udp" if udp else "tcp"
+        proto = "tcp+udp" if udp else "tcp"
         return OpResult(ok=True, detail=f"Порт {inbound_port}/{proto} открыт.")
     return res

@@ -92,8 +92,12 @@ async def test_command_nonzero_exit_reports_stderr(patch_ssh):
 
 
 def test_ufw_allow_cmd_tcp_and_udp():
+    # tcp открывается всегда; udp=True добавляет udp-правило, не заменяя tcp
+    # (Shadowsocks слушает tcp,udp — раньше tcp оставался закрыт).
     assert node_ops._ufw_allow_cmd(8443, udp=False) == "ufw allow 8443/tcp"
-    assert node_ops._ufw_allow_cmd(443, udp=True) == "ufw allow 443/udp"
+    assert node_ops._ufw_allow_cmd(443, udp=True) == (
+        "ufw allow 443/tcp && ufw allow 443/udp"
+    )
 
 
 @pytest.mark.asyncio
@@ -103,5 +107,5 @@ async def test_open_port_udp_runs_ufw(patch_ssh):
 
     res = await node_ops.open_port("1.2.3.4", "root", "PRIV", 443, udp=True)
     assert res.ok
-    assert conn.cmd == "ufw allow 443/udp"
-    assert "443/udp" in res.detail
+    assert conn.cmd == "ufw allow 443/tcp && ufw allow 443/udp"
+    assert "443/tcp+udp" in res.detail
