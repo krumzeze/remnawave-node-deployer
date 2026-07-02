@@ -277,14 +277,14 @@ class _Pipeline:
         """Токен панели из Vault по panel_token_vault_path (panels/{owner}/token).
 
         В payload токена нет — туда кладётся только путь. Если путь не задан или
-        Vault недоступен — возвращаем None, и задача падает: подставлять чужой
-        (оператора) токен в мультитенанте нельзя (ADR 0014, fail-closed)."""
+        Vault недоступен — возвращаем None, выше сработает фолбэк на
+        settings.remnawave_api_token."""
         path = self.p.get("panel_token_vault_path")
         if self.deps.vault_get is None or not path:
             return None
         try:
             data = self.deps.vault_get(path)
-        except Exception:  # noqa: BLE001 — нет токена/Vault недоступен → None, задача упадёт
+        except Exception:  # noqa: BLE001 — нет токена/Vault недоступен → фолбэк на settings
             return None
         return (data or {}).get("token") or None
 
@@ -482,14 +482,10 @@ class _Pipeline:
                 "разворот новой панели здесь не поддержан: ожидается готовая панель"
             )
 
-        # BYO-панель, мультитенант (ADR 0014): URL и токен берём только у самого
-        # тенанта (payload + его путь в Vault). Никакого фолбэка на глобальный
-        # settings.remnawave_* — иначе чужая нода ушла бы в панель оператора под
-        # его токеном (межтенантная утечка). Нет данных панели → fail-closed.
-        panel_url = self.p.get("panel_url")
-        panel_token = self._panel_token()
+        panel_url = self.p.get("panel_url") or settings.remnawave_panel_url
+        panel_token = self._panel_token() or settings.remnawave_api_token
         if not panel_url or not panel_token:
-            raise ProvisionError("не заданы URL/токен панели тенанта")
+            raise ProvisionError("не заданы URL/токен панели")
 
         # 1. Bootstrap: сервер переходит на ключевую аутентификацию.
         private_key = await self._bootstrap()

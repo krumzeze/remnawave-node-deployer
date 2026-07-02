@@ -8,14 +8,14 @@ class Settings(BaseSettings):
 
     bot_token: str = ""
 
-    # Админы бота: строка вида "111,222" из .env (ADMIN_TELEGRAM_IDS). Это НЕ
-    # барьер доступа (регистрация открытая, ADR 0014), а привилегия: выдача
-    # подписки вручную, служебные команды. Пустая строка = админов нет. Разбор
-    # в множество int — в свойстве admin_telegram_ids.
-    admin_telegram_ids_raw: str = Field(
+    # Белый список владельцев бота: строка вида "111,222" из .env
+    # (ALLOWED_TELEGRAM_IDS). Пустая строка = список пуст, и бот считается
+    # ненастроенным (никого не пускает) — см. bot/access.py. Разбор в множество
+    # int — в свойстве allowed_telegram_ids.
+    allowed_telegram_ids_raw: str = Field(
         default="",
         validation_alias=AliasChoices(
-            "ADMIN_TELEGRAM_IDS", "admin_telegram_ids_raw"
+            "ALLOWED_TELEGRAM_IDS", "allowed_telegram_ids_raw"
         ),
     )
 
@@ -32,9 +32,8 @@ class Settings(BaseSettings):
     vault_token: str = ""
     vault_kv_mount: str = "secret"
 
-    # Мультитенант (ADR 0014): панель у каждого тенанта своя (BYO), её URL/токен
-    # хранятся per-owner (Panel + Vault). Глобальной панели оператора больше нет,
-    # чтобы чужая нода не могла уйти в неё под токеном оператора.
+    remnawave_panel_url: str = ""
+    remnawave_api_token: str = ""
 
     # Каталог на хосте деплойера, куда пишутся файлы стека панели при локальном
     # разворачивании (вариант «local», ADR 0001). docker compose там же и
@@ -56,15 +55,6 @@ class Settings(BaseSettings):
     web_host: str = "0.0.0.0"
     web_port: int = 8000
 
-    # Публичный базовый URL дашборда — из него бот собирает персональную ссылку
-    # (например https://dash.example.com). Пустая строка = ссылку не показываем.
-    web_base_url: str = ""
-
-    # Секрет подписи токенов доступа к дашборду (ADR 0014). Веб пускает не по
-    # сырому owner_tg_id, а по HMAC-подписанному токену, который выдаёт бот.
-    # Пустая строка = веб-аутентификация не настроена и API отдаёт 503.
-    web_secret: str = ""
-
     @property
     def postgres_dsn(self) -> str:
         return (
@@ -73,11 +63,12 @@ class Settings(BaseSettings):
         )
 
     @property
-    def admin_telegram_ids(self) -> set[int]:
-        """ID Telegram админов бота. Разбираем строку по запятым, пустые и
-        нечисловые токены пропускаем. Пустой результат — админов нет."""
+    def allowed_telegram_ids(self) -> set[int]:
+        """ID Telegram, которым разрешён бот. Разбираем строку по запятым,
+        пустые и нечисловые токены пропускаем. Пустой результат — бот закрыт
+        для всех (ненастроен)."""
         result: set[int] = set()
-        for token in self.admin_telegram_ids_raw.split(","):
+        for token in self.allowed_telegram_ids_raw.split(","):
             token = token.strip()
             if token:
                 try:

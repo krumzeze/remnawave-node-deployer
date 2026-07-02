@@ -32,14 +32,7 @@ jobs:
             cd /root/rem-deploer
             git fetch --prune origin
             git reset --hard origin/main
-            docker compose build
-            # Миграции до старта бота/воркера: поднимаем только postgres и разово
-            # накатываем alembic в одноразовом контейнере. Так ALTER схемы не
-            # гоняется наперегонки с create_all на старте сервисов. --no-deps —
-            # чтобы не ждать vault/redis, миграции нужен только postgres.
-            docker compose up -d postgres
-            docker compose run --rm --no-deps bot alembic upgrade head
-            docker compose up -d
+            docker compose up -d --build
             # entrypoint.sh/конфиг vault примонтированы как отдельные файлы, а
             # git reset --hard заменяет их новым inode. up -d не пересоздаёт vault,
             # поэтому контейнер держит старый inode и крутит прежний скрипт.

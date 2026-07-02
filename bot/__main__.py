@@ -13,11 +13,10 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import BotCommand
 
-from bot.access import RegistrationMiddleware
+from bot.access import WhitelistMiddleware
 from bot.handlers import router
 from config import settings
-from db import get_sessionmaker, init_models
-from db.repo import upsert_user
+from db import init_models
 
 
 async def main() -> None:
@@ -30,18 +29,12 @@ async def main() -> None:
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher(storage=storage)
 
-    # Открытая регистрация (ADR 0014): каждый отправитель заводится как тенант
-    # с free-тарифом, его User прокидывается в хендлеры. Вешаем внешним
-    # middleware и на сообщения, и на callback'и. Список админов читаем лениво
-    # из settings — он один на процесс.
-    sm = get_sessionmaker()
-
-    async def _upsert(tg_id: int, is_admin: bool):
-        return await upsert_user(sm, tg_id, is_admin=is_admin)
-
-    registration = RegistrationMiddleware(_upsert, lambda: settings.admin_telegram_ids)
-    dp.message.outer_middleware(registration)
-    dp.callback_query.outer_middleware(registration)
+    # Барьер доступа: пускаем только владельцев из ALLOWED_TELEGRAM_IDS. Вешаем
+    # внешним middleware и на сообщения, и на callback'и, чтобы отсечь чужих до
+    # хендлеров. Список читаем лениво из settings — он один на процесс.
+    access = WhitelistMiddleware(lambda: settings.allowed_telegram_ids)
+    dp.message.outer_middleware(access)
+    dp.callback_query.outer_middleware(access)
 
     dp.include_router(router)
 

@@ -12,15 +12,7 @@ from aiogram.filters.callback_data import CallbackData
 
 class MenuCB(CallbackData, prefix="m"):
     """Главное меню и навигация между его разделами."""
-    action: str  # home | add | nodes | sync | panel | subscribe
-
-
-class SubCB(CallbackData, prefix="sub"):
-    """Оформление подписки (Telegram Stars, ADR 0014).
-
-    days — срок покупаемого плана; по нему в хендлере находим цену и шлём инвойс.
-    """
-    days: int
+    action: str  # home | add | nodes | sync | panel
 
 
 class NodeCB(CallbackData, prefix="n"):
