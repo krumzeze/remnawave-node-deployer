@@ -102,12 +102,15 @@ async def add_inbound_to_node(
     client,
     open_port: Callable[..., Awaitable],
     squad_uuids: list[str] | None = None,
+    probe_ports: Callable[..., Awaitable] | None = None,
 ) -> AddInboundResult:
     """Добавить инбаунд `choice` к ноде. Возвращает AddInboundResult.
 
     client — RemnawaveClient (или совместимый фейк). open_port — шов
-    node_ops.open_port. Любой шаг, который не удался, возвращает ok=False с
-    понятным текстом; необратимое (update профиля) идёт после всех проверок."""
+    node_ops.open_port; probe_ports — шов node_ops.listening_ports (None —
+    без проверки занятых портов сервера). Любой шаг, который не удался,
+    возвращает ok=False с понятным текстом; необратимое (update профиля) идёт
+    после всех проверок."""
     # 1-2. Профиль ноды и его полный config.
     node_cfg = await client.get_node_config(node_uuid)
     if not node_cfg.profile_uuid:
@@ -115,7 +118,15 @@ async def add_inbound_to_node(
     profile = await client.get_config_profile(node_cfg.profile_uuid)
     config = profile.config
 
+    # Свободный порт ищем не только среди портов профиля, но и среди реально
+    # занятых на сервере (nginx, чужие сервисы): xray не забиндит порт под чужим
+    # процессом, и инбаунд молча не заработает. Проба недоступна/упала (None) —
+    # ведём себя как раньше, только по профилю.
     used = xray_config.used_ports(config)
+    if probe_ports is not None:
+        listening = await probe_ports(ip, ssh_login, ssh_private_key)
+        if listening:
+            used |= set(listening)
     new_port = _free_port(used)
     if new_port is None:
         return AddInboundResult(False, "Нет свободного порта для нового инбаунда.")

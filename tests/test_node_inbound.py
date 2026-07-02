@@ -153,6 +153,33 @@ async def test_add_hysteria2_reuses_domain_and_opens_udp():
 
 
 @pytest.mark.asyncio
+async def test_add_inbound_skips_ports_busy_on_server():
+    # 443 занят профилем, 8443 — чужим процессом на сервере (nginx): новый
+    # инбаунд обходит оба и садится на следующий фолбэк.
+    async def probe(ip, login, key, **kw):
+        return {8443}
+
+    res, client, op = await _run(
+        InboundChoice.VLESS_GRPC_REALITY, _reality_config(), probe_ports=probe,
+    )
+    assert res.ok, res.detail
+    assert op.calls == [("1.2.3.4", 8444, False)]
+
+
+@pytest.mark.asyncio
+async def test_add_inbound_probe_failure_ignored():
+    # Проба портов не удалась (None) — выбор порта идёт только по профилю.
+    async def probe(ip, login, key, **kw):
+        return None
+
+    res, client, op = await _run(
+        InboundChoice.VLESS_GRPC_REALITY, _reality_config(), probe_ports=probe,
+    )
+    assert res.ok, res.detail
+    assert op.calls == [("1.2.3.4", 8443, False)]
+
+
+@pytest.mark.asyncio
 async def test_add_reality_inbound_reuses_node_donor():
     # Нода разворачивалась с кастомным донором Reality — добавляемый Reality-
     # инбаунд должен взять его же (dest/serverNames и sni хоста), а не дефолт.

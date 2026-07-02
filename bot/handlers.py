@@ -694,6 +694,7 @@ async def node_addcfg_pick(query: CallbackQuery, callback_data: AddCfgCB) -> Non
             choice=choice, ip=node.ip, node_uuid=node.remnawave_uuid,
             country_code="XX", ssh_login=login, ssh_private_key=priv,
             client=client, open_port=node_ops.open_port,
+            probe_ports=node_ops.listening_ports,
         )
         detail = res.detail
     except Exception as exc:  # noqa: BLE001 — сбой добавления не должен ронять бот

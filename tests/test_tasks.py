@@ -142,6 +142,10 @@ def _deps(*, client, **over):
     def build_profile(choices, **kw):
         return _generated([c.value for c in choices])
 
+    async def probe_ports(ip, login, private_key, **kw):
+        # На фейковом сервере ничего не слушает — раздача портов как раньше.
+        return set()
+
     async def sleep(_):
         return None
 
@@ -150,6 +154,7 @@ def _deps(*, client, **over):
         bootstrap_key=bootstrap_key,
         run_playbook=run_playbook,
         build_profile=build_profile,
+        probe_ports=probe_ports,
         make_client=lambda url, tok: client,
         report=report,
         sleep=sleep,
@@ -969,6 +974,79 @@ async def test_reprovision_same_set_reuses_profile_and_finishes_hosts():
     assert host["port"] == 443
     assert host["sni"] == "www.cloudflare.com"
     assert host["security"] == "reality"
+
+
+# --- Занятые порты сервера обходятся при раздаче портов инбаундов -----------
+
+class _EchoProfileClient(_FakeClient):
+    """Панель, присваивающая uuid каждому инбаунду присланного config'а.
+
+    Нужна тестам с настоящим build_profile: его теги несут per-node суффикс,
+    и фиксированная карта _FakeClient их не знает."""
+
+    async def create_config_profile(self, name, config):
+        self.created_profile_config = config
+        return CreatedProfile(
+            uuid="prof-1",
+            tag_to_inbound={
+                inb["tag"]: f"uuid-{inb['tag']}" for inb in config["inbounds"]
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_busy_server_ports_reserved_for_generator():
+    # На сервере уже слушают 443 (nginx) — генератор получает его в
+    # reserved_ports, и первый инбаунд садится на фолбэк, а не на занятый порт.
+    from orchestrator import xray_config
+
+    reports = []
+    calls = []
+    client = _EchoProfileClient([NodeConnState.ONLINE])
+
+    async def probe(ip, login, private_key, **kw):
+        return {22, 443}
+
+    deps = _deps(client=client, reports=reports,
+                 build_profile=xray_config.build_profile,
+                 run_playbook=_recording_run_playbook(calls),
+                 probe_ports=probe)
+
+    await tasks.provision_node(
+        {"deps": deps}, _payload(inbounds=["vless-reality-tcp"])
+    )
+
+    assert NodeState.ONLINE in reports
+    open_ports = [ev["inbound_ports"] for n, ev in calls if n == "open_ports.yml"][0]
+    assert open_ports == [8443]
+    assert client.created_profile_config["inbounds"][0]["port"] == 8443
+
+
+@pytest.mark.asyncio
+async def test_probe_failure_falls_back_to_blind_assignment():
+    # Снять порты не вышло (None) — раздаём как раньше (первый на 443),
+    # провижн не падает.
+    from orchestrator import xray_config
+
+    reports = []
+    calls = []
+    client = _EchoProfileClient([NodeConnState.ONLINE])
+
+    async def probe(ip, login, private_key, **kw):
+        return None
+
+    deps = _deps(client=client, reports=reports,
+                 build_profile=xray_config.build_profile,
+                 run_playbook=_recording_run_playbook(calls),
+                 probe_ports=probe)
+
+    await tasks.provision_node(
+        {"deps": deps}, _payload(inbounds=["vless-reality-tcp"])
+    )
+
+    assert NodeState.ONLINE in reports
+    open_ports = [ev["inbound_ports"] for n, ev in calls if n == "open_ports.yml"][0]
+    assert open_ports == [443]
 
 
 # ==========================================================================

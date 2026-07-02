@@ -36,7 +36,8 @@ class OpResult:
 
 
 async def _connect_run(
-    ip: str, login: str, private_key: str, command: str, *, port: int = 22
+    ip: str, login: str, private_key: str, command: str, *, port: int = 22,
+    out_max: int = _OUT_MAX,
 ) -> OpResult:
     """Подключиться по ключу и выполнить команду.
 
@@ -66,9 +67,9 @@ async def _connect_run(
         conn.close()
 
     if res.exit_status != 0:
-        detail = (res.stderr or "").strip()[:_OUT_MAX]
+        detail = (res.stderr or "").strip()[:out_max]
         return OpResult(ok=False, detail=detail or f"команда вернула код {res.exit_status}")
-    return OpResult(ok=True, detail=(res.stdout or "").strip()[:_OUT_MAX])
+    return OpResult(ok=True, detail=(res.stdout or "").strip()[:out_max])
 
 
 async def restart_node(
@@ -95,6 +96,51 @@ async def reboot_server(
             "через пару минут (статус обновит поллер).",
         )
     return res
+
+
+# Список слушающих сокетов без заголовка: tcp+udp, все интерфейсы. bind на
+# 0.0.0.0 конфликтует с любым слушателем того же порта (в т.ч. на loopback),
+# поэтому адрес не фильтруем — занят значит занят.
+_LISTENING_CMD = "ss -Htuln"
+# Список портов не должен резаться лимитом вывода OpResult: на сервере может
+# быть много слушателей, а потерянная строка — это невидимый занятый порт.
+_LISTENING_OUT_MAX = 65536
+
+
+def parse_listening_ports(output: str) -> set[int]:
+    """Разобрать вывод `ss -Htuln` в набор занятых портов.
+
+    Локальный адрес — 5-я колонка (`0.0.0.0:443`, `[::]:443`, `*:443`); порт —
+    хвост после последнего двоеточия. Непонятные строки молча пропускаем: лучше
+    недосчитаться порта, чем уронить провижн из-за формата вывода."""
+    ports: set[int] = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        tail = parts[4].rsplit(":", 1)[-1]
+        if tail.isdigit():
+            ports.add(int(tail))
+    return ports
+
+
+async def listening_ports(
+    ip: str, login: str, private_key: str, *, port: int = 22
+) -> set[int] | None:
+    """Порты, которые на сервере уже кто-то слушает (tcp и udp).
+
+    Нужно раздаче портов инбаундов: занятый чужим процессом (nginx, старая нода)
+    порт нельзя отдавать xray — bind упадёт, и инбаунд молча не заработает.
+    None — если список снять не удалось (SSH/`ss` недоступны): вызывающий код
+    решает сам, падать или раздавать вслепую, как раньше."""
+    res = await _connect_run(
+        ip, login, private_key, _LISTENING_CMD, port=port,
+        out_max=_LISTENING_OUT_MAX,
+    )
+    if not res.ok:
+        logger.warning("listening_ports: не снять порты с %s: %s", ip, res.detail)
+        return None
+    return parse_listening_ports(res.detail)
 
 
 def _ufw_allow_cmd(inbound_port: int, *, udp: bool) -> str:

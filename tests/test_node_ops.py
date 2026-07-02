@@ -91,6 +91,44 @@ async def test_command_nonzero_exit_reports_stderr(patch_ssh):
     assert "No such container" in res.detail
 
 
+_SS_OUTPUT = """\
+tcp   LISTEN 0      128        0.0.0.0:22        0.0.0.0:*
+tcp   LISTEN 0      511        0.0.0.0:443       0.0.0.0:*
+tcp   LISTEN 0      511           [::]:443          [::]:*
+tcp   LISTEN 0      4096     127.0.0.1:8443      0.0.0.0:*
+udp   UNCONN 0      0        127.0.0.53%lo:53    0.0.0.0:*
+tcp   LISTEN 0      128              *:2222            *:*
+битая строка
+"""
+
+
+def test_parse_listening_ports():
+    # Порт — хвост локального адреса (ipv4/ipv6/*); loopback тоже считается
+    # занятым (bind 0.0.0.0 конфликтует с ним); мусорные строки пропускаются.
+    ports = node_ops.parse_listening_ports(_SS_OUTPUT)
+    assert ports == {22, 443, 8443, 53, 2222}
+
+
+@pytest.mark.asyncio
+async def test_listening_ports_runs_ss(patch_ssh):
+    conn = FakeConn(FakeRun(exit_status=0, stdout=_SS_OUTPUT))
+    patch_ssh(conn=conn)
+
+    ports = await node_ops.listening_ports("1.2.3.4", "root", "PRIV")
+    assert conn.cmd == "ss -Htuln"
+    assert 443 in ports and 8443 in ports
+
+
+@pytest.mark.asyncio
+async def test_listening_ports_none_on_failure(patch_ssh):
+    # Команда упала (нет ss/нет прав) → None, а не пустой набор: вызывающий код
+    # должен отличать «не узнали» от «всё свободно».
+    conn = FakeConn(FakeRun(exit_status=127, stderr="ss: not found"))
+    patch_ssh(conn=conn)
+
+    assert await node_ops.listening_ports("1.2.3.4", "root", "PRIV") is None
+
+
 def test_ufw_allow_cmd_tcp_and_udp():
     # tcp открывается всегда; udp=True добавляет udp-правило, не заменяя tcp
     # (Shadowsocks слушает tcp,udp — раньше tcp оставался закрыт).

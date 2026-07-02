@@ -26,6 +26,7 @@ from orchestrator import (
     domain,
     local_compose,
     monitor,
+    node_ops,
     panel_setup,
     panel_stack,
     reporting,
@@ -185,6 +186,10 @@ class ProvisionDeps:
     check_domain: Callable[[str, str], Awaitable[domain.DomainCheck]] = (
         domain.check_points_to
     )
+    # Снятие занятых портов сервера по SSH (`ss -Htuln`): раздача портов
+    # инбаундов обходит их, иначе xray не сможет забиндить порт под чужим
+    # процессом (nginx, ранее поставленная нода). None от пробы = «не узнали».
+    probe_ports: Callable[..., Awaitable[set[int] | None]] = node_ops.listening_ports
     make_client: Callable[[str, str], RemnawaveClient] = _default_make_client
     vault_put: Callable[[str, dict], Any] | None = None
     vault_get: Callable[[str], dict] | None = None
@@ -537,6 +542,27 @@ class _Pipeline:
                 "инбаундами" if new_choices else
                 "Профиль ноды уже есть в панели, все выбранные инбаунды в нём",
             )
+
+        # Занятые порты сервера: отдавать их xray нельзя — bind под чужим
+        # процессом (nginx, ранее поставленная нода) упадёт, и инбаунд молча не
+        # заработает. Порты собственного профиля ноды не считаем чужими (их
+        # слушает наш же xray при повторном провижне) — о них не предупреждаем,
+        # но из раздачи новых они и так исключены.
+        listening = await self.deps.probe_ports(ip, login, private_key)
+        if listening is None:
+            await self.deps.report(
+                self.state,
+                "Не удалось снять занятые порты сервера — раздаю из пула вслепую",
+            )
+            listening = set()
+        pool = {xray_config.PORT_443, *xray_config.FALLBACK_PORTS}
+        busy_pool = sorted((listening - reserved_ports) & pool)
+        if busy_pool and new_choices:
+            await self.deps.report(
+                self.state,
+                f"Порты {busy_pool} на сервере уже заняты — обхожу их",
+            )
+        reserved_ports |= listening
 
         # Профиль собираем здесь, до deploy_node: из него берём раскладку портов,
         # чтобы открыть их в UFW прежде, чем нода начнёт принимать трафик. Сам
