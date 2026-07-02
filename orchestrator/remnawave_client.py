@@ -416,6 +416,26 @@ class RemnawaveClient:
             return CreatedProfile(uuid=str(prof.uuid), tag_to_inbound=mapping)
         return None
 
+    async def find_config_profile_by_name(self, name: str) -> FetchedProfile | None:
+        """Найти профиль по имени и вернуть его с ПОЛНЫМ Xray-config, либо None.
+
+        Нужно повторному провижну той же ноды: если профиль `node-<ip>` уже есть,
+        недостающие инбаунды дописываются в него (read-modify-write, как при
+        добавлении инбаунда к ноде), а не создаётся дубль. Защитно: листинг
+        недоступен/упал — None, вызывающий код пойдёт путём создания."""
+        try:
+            resp = await self._sdk.config_profiles.get_config_profiles()
+        except Exception:  # noqa: BLE001 — недоступность листинга не должна ломать провижн
+            return None
+        for prof in getattr(resp, "config_profiles", None) or []:
+            if getattr(prof, "name", None) != name:
+                continue
+            try:
+                return await self.get_config_profile(str(prof.uuid))
+            except Exception:  # noqa: BLE001 — не прочитался профиль → как будто его нет
+                return None
+        return None
+
     async def create_config_profile(self, name: str, config: dict) -> CreatedProfile:
         """Создать config-profile из готового Xray-конфига (вариант «авто»).
 

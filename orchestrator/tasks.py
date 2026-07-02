@@ -32,7 +32,11 @@ from orchestrator import (
     ssh_bootstrap,
     xray_config,
 )
-from orchestrator.remnawave_client import NodeConnState, RemnawaveClient
+from orchestrator.remnawave_client import (
+    CreatedProfile,
+    NodeConnState,
+    RemnawaveClient,
+)
 from orchestrator.statemachine import NodeState, can_transition
 from orchestrator.xray_config import TLS_CHOICES, InboundChoice
 
@@ -444,22 +448,17 @@ class _Pipeline:
 
     async def _open_inbound_ports(
         self, ip: str, login: str, private_key: str,
-        generated: xray_config.GeneratedProfile,
+        ports: list[int], udp_ports: list[int],
     ) -> None:
         """Открыть в UFW порты занятые выбранными inbound'ами (ADR 0005).
 
-        Открываем ровно те порты, что генератор раздал inbound'ам, а не весь
-        пул фолбэков. Порт 80 для ACME здесь не трогаем — его открывает
+        Открываем ровно порты наших inbound'ов (новых и уже лежащих в профиле),
+        а не весь пул фолбэков. udp — только тем, кто слушает и его (Shadowsocks,
+        Hysteria2). Порт 80 для ACME здесь не трогаем — его открывает
         issue_cert.yml и только для TLS-набора (для domain-free 80 не нужен).
         """
-        ports = sorted(set(generated.ports.values()))
         if not ports:
-            raise ProvisionError("генератор не вернул портов inbound'ов")
-
-        # Shadowsocks слушает ещё и udp (network: tcp,udp в конфиге) — открываем
-        # udp только его порту, остальным inbound'ам udp не нужен. Список udp-портов
-        # отдаёт генератор (теги несут per-node суффикс, опознать SS по тегу нельзя).
-        udp_ports = sorted(set(generated.udp_ports))
+            raise ProvisionError("не определены порты inbound'ов")
 
         await self.deps.report(self.state, f"Открываю порты в UFW: {ports}")
         result = await self.deps.run_playbook(
@@ -512,6 +511,33 @@ class _Pipeline:
             ip, login, private_key, choices
         )
 
+        client = self.deps.make_client(panel_url, panel_token)
+
+        # Повторный провижн той же ноды: профиль `node-<ip>` мог уже существовать
+        # (с тем же или другим набором инбаундов). Тогда недостающие инбаунды
+        # ДОПИСЫВАЮТСЯ в него ниже (read-modify-write, как при добавлении
+        # инбаунда к ноде), а их порты раздаются в обход уже занятых профилем.
+        # Раньше здесь падало «панель не вернула ни одного inbound по нашим
+        # тегам»: create_config_profile возвращал старый профиль без новых тегов.
+        tag_suffix = ip.replace(".", "-")
+        existing_profile = await client.find_config_profile_by_name(_panel_name(ip))
+        if existing_profile is None:
+            new_choices = list(choices)
+            reserved_ports: set[int] = set()
+        else:
+            existing_tags = set(existing_profile.tag_to_inbound)
+            new_choices = [
+                c for c in choices
+                if f"{c.value}-{tag_suffix}" not in existing_tags
+            ]
+            reserved_ports = xray_config.used_ports(existing_profile.config)
+            await self.deps.report(
+                self.state,
+                "Профиль ноды уже есть в панели — дополню его недостающими "
+                "инбаундами" if new_choices else
+                "Профиль ноды уже есть в панели, все выбранные инбаунды в нём",
+            )
+
         # Профиль собираем здесь, до deploy_node: из него берём раскладку портов,
         # чтобы открыть их в UFW прежде, чем нода начнёт принимать трафик. Сам
         # config уйдёт в панель ниже, на шаге REGISTERING.
@@ -524,26 +550,62 @@ class _Pipeline:
             self.p.get("reality_server_names")
             or xray_config.DEFAULT_REALITY_SERVER_NAMES
         )
-        generated = self.deps.build_profile(
-            choices,
-            reality_dest=reality_dest,
-            reality_server_names=reality_server_names,
-            tls_domain=tls_domain,
-            cert_file=cert_file,
-            key_file=key_file,
-            # Per-node суффикс тегов: панель требует глобально уникальные теги
-            # инбаундов, иначе вторая нода падает с 409 «same tag already exists».
-            tag_suffix=ip.replace(".", "-"),
-        )
+        generated = None
+        if new_choices:
+            generated = self.deps.build_profile(
+                new_choices,
+                reality_dest=reality_dest,
+                reality_server_names=reality_server_names,
+                tls_domain=tls_domain,
+                cert_file=cert_file,
+                key_file=key_file,
+                # Per-node суффикс тегов: панель требует глобально уникальные теги
+                # инбаундов, иначе вторая нода падает с 409 «same tag already exists».
+                tag_suffix=tag_suffix,
+                reserved_ports=reserved_ports,
+            )
+
+        # Сводная раскладка НАШИХ инбаундов (tag → порт/подсказка хоста): новые —
+        # из генератора; уже лежащие в существующем профиле — из самого профиля
+        # (порт как есть, sni/домен восстанавливаются из streamSettings, донор
+        # мог быть кастомным). По ней открываются порты и заводятся хосты.
+        pub_ports: dict[str, int] = {}
+        pub_hints: dict[str, xray_config.HostHint] = {}
+        udp_ports: set[int] = set()
+        if generated is not None:
+            pub_ports.update(generated.ports)
+            pub_hints.update(generated.hosts)
+            udp_ports.update(generated.udp_ports)
+        if existing_profile is not None:
+            by_tag = {
+                inb.get("tag"): inb
+                for inb in existing_profile.config.get("inbounds", []) or []
+            }
+            for choice in choices:
+                tag = f"{choice.value}-{tag_suffix}"
+                if tag in pub_ports:
+                    continue
+                inb = by_tag.get(tag)
+                port = (inb or {}).get("port")
+                if not isinstance(port, int):
+                    continue
+                pub_ports[tag] = port
+                hint = xray_config.host_hint_for_existing_inbound(inb)
+                if hint is not None:
+                    pub_hints[tag] = hint
+                if choice in (InboundChoice.SHADOWSOCKS, InboundChoice.HYSTERIA2):
+                    udp_ports.add(port)
 
         # hardening поставил default deny + только 22; теперь разрешаем порты
         # выбранных inbound'ов, иначе трафик до ноды не дойдёт. Делаем до старта
         # контейнера, чтобы он поднимался уже за открытым firewall'ом.
-        await self._open_inbound_ports(ip, login, private_key, generated)
+        await self._open_inbound_ports(
+            ip, login, private_key,
+            sorted(set(pub_ports.values())), sorted(udp_ports),
+        )
 
         # Нода доверяет панели по её публичному ключу (ADR 0004): кладём его в
         # SSL_CERT контейнера. Порт ноды задаём сами — он же уйдёт в create_node.
-        client = self.deps.make_client(panel_url, panel_token)
         panel_pubkey = await client.get_panel_pubkey()
 
         deploy = await self.deps.run_playbook(
@@ -563,10 +625,25 @@ class _Pipeline:
         await self._advance(NodeState.REGISTERING, "Регистрирую ноду в панели")
 
         # Панель сама присваивает inbound'ам uuid'ы; связываем по тегам (ADR 0006).
-        profile = await client.create_config_profile(_panel_name(ip), generated.config)
+        # Существующий профиль дополняем недостающими инбаундами (update заменяет
+        # config целиком, поэтому шлём старые inbounds + новые), новый — создаём.
+        if existing_profile is None:
+            profile = await client.create_config_profile(
+                _panel_name(ip), generated.config
+            )
+        elif generated is not None:
+            cfg = existing_profile.config
+            cfg.setdefault("inbounds", []).extend(generated.config["inbounds"])
+            profile = await client.update_config_profile(existing_profile.uuid, cfg)
+        else:
+            profile = CreatedProfile(
+                uuid=existing_profile.uuid,
+                tag_to_inbound=dict(existing_profile.tag_to_inbound),
+            )
+
         active_inbounds = [
             profile.tag_to_inbound[tag]
-            for tag in generated.tags
+            for tag in pub_ports
             if tag in profile.tag_to_inbound
         ]
         if not active_inbounds:
@@ -582,11 +659,26 @@ class _Pipeline:
         )
         await self._persist_node(remnawave_uuid=node.uuid)
 
+        # Повторный провижн: нода могла уже существовать (create_node её
+        # переиспользовал) — тогда наши инбаунды надо дописать в её активные,
+        # не сбрасывая уже включённые. Для свежесозданной ноды список совпадает
+        # и обновление пропускается.
+        if existing_profile is not None:
+            node_cfg = await client.get_node_config(node.uuid)
+            merged_active = list(
+                dict.fromkeys(node_cfg.active_inbound_uuids + active_inbounds)
+            )
+            if set(merged_active) != set(node_cfg.active_inbound_uuids):
+                await client.update_node_active_inbounds(
+                    node.uuid, profile.uuid, merged_active
+                )
+
         # 3b. Публикация пользователям (ADR 0008): на каждый инбаунд заводим host
         # (строку подключения в подписке) и добавляем инбаунды в выбранные сквады.
         # Без этого нода дойдёт до online, но у пользователей не появится.
         await self._publish_to_users(
-            client, ip, node.uuid, profile, active_inbounds, generated, tls_domain
+            client, ip, node.uuid, profile, active_inbounds,
+            list(pub_ports), pub_ports, pub_hints, tls_domain,
         )
 
         # 4. Поллинг до online.
@@ -601,15 +693,18 @@ class _Pipeline:
         node_uuid: str,
         profile,
         active_inbounds: list[str],
-        generated: xray_config.GeneratedProfile,
+        tags: list[str],
+        ports: dict[str, int],
+        hints: dict[str, xray_config.HostHint],
         tls_domain: str | None,
     ) -> None:
         """Завести host'ы и привязать инбаунды к сквадам (ADR 0008).
 
         На каждый выбранный инбаунд — один host. Адрес: для TLS-инбаунда домен
         ноды (под него выпущен сертификат), для остального — IP. Параметры
-        (security/sni/path/fingerprint) берём из подсказок генератора, оператор
-        их не вводит.
+        (security/sni/path/fingerprint) приходят раскладкой tag→порт/подсказка:
+        для новых инбаундов — от генератора, для уже лежавших в профиле — из
+        самого профиля; оператор их не вводит.
 
         Сквады: берём из payload (оператор выбрал в боте); если не заданы —
         дефолт «все сквады панели» (ADR 0008). Инбаунды дописываются к текущему
@@ -626,14 +721,14 @@ class _Pipeline:
         # минимуму, а где доступен — ещё и по uuid инбаунда.
         existing_hosts = await client.list_hosts()
 
-        for tag in generated.tags:
+        for tag in tags:
             inbound_uuid = profile.tag_to_inbound.get(tag)
             if inbound_uuid is None:
                 continue
-            hint = generated.hosts.get(tag)
+            hint = hints.get(tag)
             security = hint.security if hint else "default"
             address = tls_domain if (security == "tls" and tls_domain) else ip
-            port = generated.ports[tag]
+            port = ports[tag]
             if _host_exists(existing_hosts, inbound_uuid, address, port):
                 await self.deps.report(
                     self.state, f"Хост для {address}:{port} уже есть — пропускаю"

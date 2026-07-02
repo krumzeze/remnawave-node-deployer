@@ -37,6 +37,10 @@ class _FakeClient:
     async def get_panel_pubkey(self):
         return "PANEL_PUBKEY"
 
+    async def find_config_profile_by_name(self, name):
+        # По умолчанию профиля с таким именем в панели нет — чистый провижн.
+        return None
+
     async def create_config_profile(self, name, config):
         self.created_profile_config = config
         # Панель присваивает inbound'ам uuid'ы и возвращает их по тегам.
@@ -816,6 +820,155 @@ async def test_tls_open_ports_excludes_80():
     assert "issue_cert.yml" in names
     assert open_ports == [443]
     assert 80 not in open_ports
+
+
+# --- Повторный провижн: существующий профиль дополняется, а не пересоздаётся --
+
+class _ReprovisionClient(_FakeClient):
+    """Панель, в которой профиль node-1-2-3-4 уже существует.
+
+    Профиль несёт один TLS-инбаунд на 443; провижн с другим набором должен
+    дописать новые инбаунды в этот профиль (update), а не создавать новый и не
+    падать на пустых active_inbounds."""
+
+    def __init__(self, statuses, profile_config, tag_to_inbound,
+                 node_active=("inb-tls",)):
+        super().__init__(statuses)
+        self._profile_config = profile_config
+        self._tag_to_inbound = dict(tag_to_inbound)
+        self._node_active = list(node_active)
+        self.updated_config = None
+        self.node_active_update = None
+
+    async def find_config_profile_by_name(self, name):
+        from orchestrator.remnawave_client import FetchedProfile
+
+        return FetchedProfile(
+            uuid="prof-old", name=name, config=self._profile_config,
+            tag_to_inbound=dict(self._tag_to_inbound),
+        )
+
+    async def create_config_profile(self, name, config):
+        raise AssertionError("существующий профиль не должен создаваться заново")
+
+    async def update_config_profile(self, uuid, config):
+        self.updated_config = config
+        return CreatedProfile(
+            uuid=uuid,
+            tag_to_inbound={
+                inb["tag"]: f"uuid-{inb['tag']}" for inb in config["inbounds"]
+            },
+        )
+
+    async def get_node_config(self, uuid):
+        from orchestrator.remnawave_client import NodeProfileRef
+
+        return NodeProfileRef(
+            node_uuid=uuid, profile_uuid="prof-old",
+            active_inbound_uuids=list(self._node_active),
+        )
+
+    async def update_node_active_inbounds(self, uuid, profile_uuid, inbounds):
+        self.node_active_update = (uuid, profile_uuid, list(inbounds))
+
+
+def _tls_profile_config():
+    return {
+        "inbounds": [
+            {"tag": "vless-xhttp-tls-1-2-3-4", "port": 443,
+             "streamSettings": {
+                 "security": "tls",
+                 "tlsSettings": {"serverName": "vpn.example.com"},
+             }},
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_reprovision_appends_new_inbound_to_existing_profile():
+    # Нода уже провижнена с xhttp+tls; повторный запуск с reality-tcp должен
+    # дописать инбаунд в существующий профиль на СВОБОДНЫЙ порт (443 занят),
+    # включить его в активные у ноды (не сбросив старый) и завести host.
+    from orchestrator import xray_config
+
+    reports = []
+    calls = []
+    client = _ReprovisionClient(
+        [NodeConnState.ONLINE], _tls_profile_config(),
+        {"vless-xhttp-tls-1-2-3-4": "inb-tls"},
+    )
+    deps = _deps(client=client, reports=reports,
+                 build_profile=xray_config.build_profile,
+                 run_playbook=_recording_run_playbook(calls))
+
+    await tasks.provision_node(
+        {"deps": deps}, _payload(inbounds=["vless-reality-tcp"])
+    )
+
+    assert NodeState.ONLINE in reports
+    assert NodeState.FAILED not in reports
+    # Профиль обновлён: старый инбаунд на месте, новый дописан не на 443.
+    tags = {i["tag"]: i for i in client.updated_config["inbounds"]}
+    assert "vless-xhttp-tls-1-2-3-4" in tags
+    new_inb = tags["vless-reality-tcp-1-2-3-4"]
+    assert new_inb["port"] == 8443
+    # В активные create_node ушёл только наш инбаунд; ноде дописали его к старым.
+    assert client.create_node_kwargs["active_inbounds"] == [
+        "uuid-vless-reality-tcp-1-2-3-4"
+    ]
+    _, _, merged = client.node_active_update
+    assert "inb-tls" in merged
+    assert "uuid-vless-reality-tcp-1-2-3-4" in merged
+    # Host заведён на новый порт; в UFW открыт именно он.
+    host = client.hosts_created[0]
+    assert host["port"] == 8443
+    assert host["security"] == "reality"
+    open_ports = [ev["inbound_ports"] for n, ev in calls if n == "open_ports.yml"][0]
+    assert open_ports == [8443]
+
+
+@pytest.mark.asyncio
+async def test_reprovision_same_set_reuses_profile_and_finishes_hosts():
+    # Повторный провижн с тем же набором (ретрай после сбоя): профиль не
+    # трогаем, но недостающий host дозаводится по данным самого профиля —
+    # с его портом и его донором (sni), а не дефолтами генератора.
+    reality_config = {
+        "inbounds": [
+            {"tag": "vless-reality-tcp-1-2-3-4", "port": 443,
+             "streamSettings": {
+                 "security": "reality",
+                 "realitySettings": {"serverNames": ["www.cloudflare.com"]},
+             }},
+        ]
+    }
+    reports = []
+    calls = []
+    client = _ReprovisionClient(
+        [NodeConnState.ONLINE], reality_config,
+        {"vless-reality-tcp-1-2-3-4": "inb-reality"},
+        node_active=("inb-reality",),
+    )
+    from orchestrator import xray_config
+
+    deps = _deps(client=client, reports=reports,
+                 build_profile=xray_config.build_profile,
+                 run_playbook=_recording_run_playbook(calls))
+
+    await tasks.provision_node(
+        {"deps": deps}, _payload(inbounds=["vless-reality-tcp"])
+    )
+
+    assert NodeState.ONLINE in reports
+    # Ничего не создавали и не обновляли — набор совпал.
+    assert client.updated_config is None
+    # Активные у ноды уже содержат наш инбаунд — обновление не понадобилось...
+    assert client.create_node_kwargs["active_inbounds"] == ["inb-reality"]
+    assert client.node_active_update is None
+    # ...а host дозаведён с портом и донором из профиля.
+    host = client.hosts_created[0]
+    assert host["port"] == 443
+    assert host["sni"] == "www.cloudflare.com"
+    assert host["security"] == "reality"
 
 
 # ==========================================================================

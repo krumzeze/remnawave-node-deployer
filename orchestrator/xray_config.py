@@ -125,6 +125,19 @@ def available_choices_for_node(
     return out
 
 
+def used_ports(config: dict) -> set[int]:
+    """Порты, занятые инбаундами Xray-конфига (профиля панели).
+
+    Нужно и добавлению инбаунда к ноде, и повторному провижну: новые инбаунды
+    не должны садиться на порт, который в профиле уже занят."""
+    ports: set[int] = set()
+    for inb in config.get("inbounds", []) or []:
+        p = inb.get("port")
+        if isinstance(p, int):
+            ports.add(p)
+    return ports
+
+
 def _b64url_nopad(raw: bytes) -> str:
     """base64url без выравнивания — формат ключей, как у Xray (`x25519`)."""
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
@@ -224,6 +237,23 @@ def _host_hint(choice: InboundChoice, *, server_names: list[str],
         path=shape.get("path"),
         fingerprint=fingerprint,
     )
+
+
+def host_hint_for_existing_inbound(inbound: dict) -> HostHint | None:
+    """Восстановить HostHint по инбаунду, уже лежащему в профиле панели.
+
+    Нужно повторному провижну: инбаунд в профиле есть, а host для него мог не
+    завестись (провижн оборвался). Параметры хоста восстанавливаем из самого
+    инбаунда — sni Reality из его serverNames (донор мог быть кастомным), домен
+    TLS из tlsSettings, — а не из дефолтов генератора. Для неопознаваемого тега
+    возвращаем None."""
+    choice = base_choice_from_tag(inbound.get("tag") or "")
+    if choice is None:
+        return None
+    ss = inbound.get("streamSettings") or {}
+    server_names = list((ss.get("realitySettings") or {}).get("serverNames") or [])
+    tls_domain = (ss.get("tlsSettings") or {}).get("serverName")
+    return _host_hint(choice, server_names=server_names, tls_domain=tls_domain)
 
 
 def generate_reality_keys(*, short_id_count: int = 3) -> RealityKeys:
@@ -394,13 +424,16 @@ def _build_inbound(choice: InboundChoice, port: int, *, keys: RealityKeys | None
 
 
 def _assign_ports(choices: list[InboundChoice],
-                  overrides: dict[InboundChoice, int] | None) -> dict[InboundChoice, int]:
+                  overrides: dict[InboundChoice, int] | None,
+                  reserved: set[int] | None = None) -> dict[InboundChoice, int]:
     """Раздать порты без конфликтов: первый → 443, дальше из FALLBACK_PORTS.
 
     overrides позволяет оператору закрепить порт за конкретным inbound'ом.
+    reserved — порты, которые раздавать нельзя (уже заняты инбаундами
+    существующего профиля при повторном провижне).
     """
     overrides = overrides or {}
-    used: set[int] = set(overrides.values())
+    used: set[int] = set(overrides.values()) | set(reserved or ())
     ports: dict[InboundChoice, int] = {}
     pool = iter((PORT_443, *FALLBACK_PORTS))
 
@@ -408,9 +441,15 @@ def _assign_ports(choices: list[InboundChoice],
         if choice in overrides:
             ports[choice] = overrides[choice]
             continue
-        port = next(pool)
-        while port in used:
+        try:
             port = next(pool)
+            while port in used:
+                port = next(pool)
+        except StopIteration:
+            raise ValueError(
+                "пул портов инбаундов исчерпан: слишком много инбаундов "
+                "или занятых портов в профиле"
+            ) from None
         ports[choice] = port
         used.add(port)
     return ports
@@ -426,6 +465,7 @@ def build_profile(
     key_file: str | None = None,
     port_overrides: dict[InboundChoice, int] | None = None,
     tag_suffix: str = "",
+    reserved_ports: set[int] | None = None,
 ) -> GeneratedProfile:
     """Собрать полный Xray-конфиг под выбранные inbound'ы.
 
@@ -438,6 +478,10 @@ def build_profile(
     отвергает дубль тега с 409). Передаём сюда стабильный per-node идентификатор
     (например, slug IP) — иначе вторая нода ловит «Inbounds with same tag already
     exists», т.к. набор пунктов меню у всех нод одинаков.
+
+    reserved_ports — порты, уже занятые существующим профилем ноды: при
+    повторном провижне новые инбаунды дописываются в тот же профиль и не должны
+    конфликтовать портами со старыми.
     """
     if not choices:
         raise ValueError("список inbound'ов пуст: нужен хотя бы один")
@@ -452,7 +496,7 @@ def build_profile(
             "для TLS-инбаундов нужны tls_domain, cert_file и key_file"
         )
 
-    ports = _assign_ports(ordered, port_overrides)
+    ports = _assign_ports(ordered, port_overrides, reserved_ports)
 
     inbounds: list[dict] = []
     tags: list[str] = []

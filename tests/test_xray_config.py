@@ -130,6 +130,60 @@ def test_tls_inbound_uses_domain_and_cert_paths():
     assert prof.reality_keys == {}
 
 
+def test_reserved_ports_are_skipped():
+    # Повторный провижн: порты существующего профиля исключаются из раздачи —
+    # первый инбаунд не садится на занятый 443, а берёт следующий из пула.
+    prof = build_profile(
+        [InboundChoice.VLESS_REALITY_TCP, InboundChoice.SHADOWSOCKS],
+        reserved_ports={443, 8443},
+    )
+    ports = list(prof.ports.values())
+    assert ports == [8444, 2053]
+
+
+def test_pool_exhaustion_raises_value_error():
+    # Все порты пула зарезервированы — понятная ошибка вместо StopIteration.
+    from orchestrator.xray_config import FALLBACK_PORTS, PORT_443
+
+    with pytest.raises(ValueError):
+        build_profile(
+            [InboundChoice.VLESS_REALITY_TCP],
+            reserved_ports={PORT_443, *FALLBACK_PORTS},
+        )
+
+
+def test_host_hint_for_existing_inbound_restores_donor_and_domain():
+    # Подсказка хоста восстанавливается из инбаунда профиля: sni Reality — его
+    # serverNames (кастомный донор), для TLS — домен из tlsSettings.
+    from orchestrator.xray_config import host_hint_for_existing_inbound
+
+    reality = {
+        "tag": "vless-reality-tcp-1-2-3-4",
+        "streamSettings": {
+            "security": "reality",
+            "realitySettings": {"serverNames": ["www.cloudflare.com"]},
+        },
+    }
+    hint = host_hint_for_existing_inbound(reality)
+    assert hint.security == "reality"
+    assert hint.sni == "www.cloudflare.com"
+    assert hint.fingerprint == "firefox"
+
+    tls = {
+        "tag": "vless-xhttp-tls-1-2-3-4",
+        "streamSettings": {
+            "security": "tls",
+            "tlsSettings": {"serverName": "vpn.example.com"},
+        },
+    }
+    hint = host_hint_for_existing_inbound(tls)
+    assert hint.security == "tls"
+    assert hint.sni == "vpn.example.com"
+
+    # Неопознаваемый тег → None.
+    assert host_hint_for_existing_inbound({"tag": "custom"}) is None
+
+
 def test_shadowsocks_method_and_password():
     prof = build_profile([InboundChoice.SHADOWSOCKS])
     inb = prof.config["inbounds"][0]
